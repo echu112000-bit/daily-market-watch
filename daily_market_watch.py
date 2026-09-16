@@ -22,9 +22,13 @@
     移動平均乖離(5/25/75/200日)、RSI/MACD/モメンタム/サイコロジカル等の指標と
     判定(買/売/無/強/弱/通)、売り・中立・買いシグナルの集計が1ページにまとまっている
     (table.tb-teck の tbody tr = 指標ごとの行)。
+    発行済株式数は公開されていないが、`/stock/{code}/` (株価タブ)の
+    table.tb-st-font に「時価総額」(例: 5985億4500万)があるので、
+    時価総額 ÷ 株価 で概算し、空売り比率の算出に使う。
 
-  ※ 発行済株式数に対する空売り比率や、個別のニュース背景(株価変動の理由)は
-    これらのサイトから機械的に取得できないため、このレポートには含めていない。
+  ※ 個別のニュース背景(株価変動の理由)は、これらのサイトから機械的に
+    取得できないため、このレポートには含めていない。発行済株式数も実際の
+    開示値ではなく時価総額からの逆算(概算)である点に注意。
 
 ■ セットアップ
   pip install requests beautifulsoup4 playwright
@@ -122,6 +126,8 @@ class StockSnapshot:
     summary_counts: dict = field(default_factory=dict)        # {"sell":0,"neutral":4,"buy":3}
     short_positions: list = field(default_factory=list)       # [{"firm","balance","change","date"}]
     short_positions_total: int = None
+    shares_outstanding: int = None                            # 時価総額÷株価から逆算した概算値
+    short_ratio: float = None                                 # 空売り合計 / 発行済株式数 (%)
     daily_change_history: list = field(default_factory=list)  # [{"date","price","change_pct","zenzougen"}]
     margin_sell: dict = None                                  # {"balance","change","date"}
     margin_buy: dict = None
@@ -387,6 +393,38 @@ def fetch_technical_indicators(code: str) -> dict:
     return result
 
 
+def _parse_japanese_amount(text: str):
+    """ "5985億4500万" -> 598545000000 (円) """
+    text = text.strip()
+    m_oku = re.search(r"([\d,]+)億", text)
+    m_man = re.search(r"([\d,]+)万", text)
+    if not m_oku and not m_man:
+        return None
+    total = 0
+    if m_oku:
+        total += int(m_oku.group(1).replace(",", "")) * 10**8
+    if m_man:
+        total += int(m_man.group(1).replace(",", "")) * 10**4
+    return total
+
+
+def fetch_market_cap(code: str):
+    """
+    nikkeiyosoku.com の株価ページ(静的HTML)から時価総額(円)を取得する。
+    発行済株式数が非公開のため、空売り比率の概算に使う。
+    """
+    url = f"https://nikkeiyosoku.com/stock/{code}/"
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for tr in soup.select("table.tb-st-font tr"):
+        tds = tr.find_all("td")
+        if len(tds) >= 2 and tds[0].get_text(strip=True) == "時価総額":
+            return _parse_japanese_amount(tds[1].get_text(strip=True))
+    return None
+
+
 def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
     snap = StockSnapshot(code=ticker["code"], name=ticker["name"])
     snap.date = short_data.get("date")
@@ -410,6 +448,13 @@ def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
     snap.ma_deviation = tech_data.get("ma_deviation", {})
     snap.indicators = tech_data.get("indicators", [])
     snap.summary_counts = tech_data.get("summary_counts", {})
+
+    market_cap = fetch_market_cap(ticker["code"])
+    if market_cap and snap.price:
+        snap.shares_outstanding = round(market_cap / snap.price)
+    if snap.short_positions_total and snap.shares_outstanding:
+        snap.short_ratio = snap.short_positions_total / snap.shares_outstanding * 100
+
     return snap
 
 
@@ -555,6 +600,14 @@ def _render_stock_section(s: StockSnapshot) -> str:
             f"<tr><td><strong>合計(概算)</strong></td>"
             f"<td class='num'><strong>{s.short_positions_total:,}株</strong></td><td class='num'>—</td></tr>"
         )
+        if s.short_ratio is not None:
+            oku_shares = s.shares_outstanding / 10**8
+            ratio_note = (
+                f'<p class="note">発行済株式数に対する比率(概算): <strong>約{s.short_ratio:.1f}%</strong>'
+                f"(時価総額÷株価から逆算した約{oku_shares:.2f}億株ベース)</p>"
+            )
+        else:
+            ratio_note = ""
         short_table = f"""
         <h3 class="sub">大口空売り残高(機関投資家・最新判明分)</h3>
         <div class="table-scroll">
@@ -563,6 +616,7 @@ def _render_stock_section(s: StockSnapshot) -> str:
             {short_rows}{total_row}
           </table>
         </div>
+        {ratio_note}
         """
     else:
         short_table = '<h3 class="sub">大口空売り残高</h3><p class="note">大口空売りデータなし</p>'
@@ -632,8 +686,10 @@ def _render_stock_section(s: StockSnapshot) -> str:
 
     summary_facts = []
     if s.short_positions_total:
+        ratio_text = f" / 発行済株式数比{s.short_ratio:.1f}%" if s.short_ratio is not None else ""
         summary_facts.append(
-            f"大口空売り残高 合計(概算): {s.short_positions_total:,}株({len(s.short_positions)}社が最新判明分)"
+            f"大口空売り残高 合計(概算): {s.short_positions_total:,}株"
+            f"({len(s.short_positions)}社が最新判明分){ratio_text}"
         )
     if s.margin_history:
         latest_margin = s.margin_history[-1]
