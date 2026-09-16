@@ -3,10 +3,10 @@
 =========================================
 
 やること:
-1. stockscope.app から各銘柄の「大口空売り残高」「個人信用残高」を取得
-2. nikkeiyosoku.com から RSI を取得
-3. 簡易HTMLレポートを組み立てて保存する
-4. (任意) メールやSlack/LINEなどに通知
+1. stockscope.app から各銘柄の「大口空売り残高」「個人信用残高」の推移を取得
+2. nikkeiyosoku.com から RSI・移動平均乖離・MACD等のテクニカル指標を取得
+3. 見た目付きのHTMLレポート(reports/YYYY-MM-DD.html)を組み立てて保存する
+4. GitHub Pagesで公開したレポートへのリンクをDiscordに通知する
 
 ■ サイトの実際の構造(2026-09-16 に確認済み)
   - stockscope.app: Next.js + antd の Table でクライアント側(JS)描画される。
@@ -18,9 +18,13 @@
     機関ごとの残高セルはデータがある日だけ「残高\n増減」の2行、ない日は「-」。
     機関の一覧・数は銘柄ごとに異なるため、ヘッダー行から動的に取得する。
   - nikkeiyosoku.com: サーバー側で描画された静的HTMLなので requests + BeautifulSoup で
-    そのまま取得できる。RSIの時系列テーブルは
-    `<table>` の thead に [日付, 終値, 前日比, 前日比％, RSI] という見出しがあり、
-    tbody の最初の行(tr)が最新日のデータ。
+    そのまま取得できる。`/stock/technical/{code}/` (テクニカル分析タブ) に
+    移動平均乖離(5/25/75/200日)、RSI/MACD/モメンタム/サイコロジカル等の指標と
+    判定(買/売/無/強/弱/通)、売り・中立・買いシグナルの集計が1ページにまとまっている
+    (table.tb-teck の tbody tr = 指標ごとの行)。
+
+  ※ 発行済株式数に対する空売り比率や、個別のニュース背景(株価変動の理由)は
+    これらのサイトから機械的に取得できないため、このレポートには含めていない。
 
 ■ セットアップ
   pip install requests beautifulsoup4 playwright
@@ -92,6 +96,7 @@ EXTRACT_TABLE_JS = """
       price: cells[1],
       volume: cells[2],
       firms: cells.slice(3, 3 + numFirms),
+      zenzougen: cells[3 + numFirms],
       sell: cells[3 + numFirms + 1],
       buy: cells[3 + numFirms + 2],
     };
@@ -106,15 +111,21 @@ EXTRACT_TABLE_JS = """
 class StockSnapshot:
     code: str
     name: str
+    market: str = None
     date: str = ""
     price: int = None
     change_pct: float = None
+    price_change: float = None
     volume: int = None
-    rsi: float = None
-    rsi_date: str = ""
-    short_positions: list = field(default_factory=list)   # [{"firm":..., "balance":..., "change":..., "date":...}]
-    margin_sell: dict = None   # {"balance":..., "change":..., "date":...}
+    ma_deviation: dict = field(default_factory=dict)          # {"5日": "-5.31%", ...}
+    indicators: list = field(default_factory=list)            # [{"name","value","judge","judge_class"}]
+    summary_counts: dict = field(default_factory=dict)        # {"sell":0,"neutral":4,"buy":3}
+    short_positions: list = field(default_factory=list)       # [{"firm","balance","change","date"}]
+    short_positions_total: int = None
+    daily_change_history: list = field(default_factory=list)  # [{"date","price","change_pct","zenzougen"}]
+    margin_sell: dict = None                                  # {"balance","change","date"}
     margin_buy: dict = None
+    margin_history: list = field(default_factory=list)        # [{"date","sell_balance","sell_change","buy_balance","buy_change","ratio"}]
 
 
 def _parse_price_cell(text: str):
@@ -165,15 +176,27 @@ def _parse_int_cell(text: str):
         return None
 
 
+def _parse_signed_int(text: str):
+    text = text.strip()
+    if text in ("", "-"):
+        return None
+    try:
+        return int(text.replace(",", "").replace("+", ""))
+    except ValueError:
+        return None
+
+
 def fetch_short_selling(code: str, page) -> dict:
     """
     stockscope.app の大口空売り残高ページを、レンダリング済みDOMから取得する。
     機関ごとの残高・個人信用残高は毎日更新されるわけではないため、
     直近の掲載範囲(最大20営業日)の中で最新の実データを機関ごとに探す。
+    あわせて、空売り全体の日次増減・個人信用残高の推移も時系列で拾う。
     """
     empty = {
         "date": None, "price": None, "change_pct": None, "volume": None,
         "short_positions": [], "margin_sell": None, "margin_buy": None,
+        "daily_change_history": [], "margin_history": [],
     }
 
     url = f"https://stockscope.app/outstanding-short-selling-balances/{code}"
@@ -220,17 +243,34 @@ def fetch_short_selling(code: str, page) -> dict:
 
     margin_sell = None
     margin_buy = None
+    margin_history = []
     for row in rows:
-        if margin_sell is None:
-            balance, change = _parse_balance_cell(row["sell"])
-            if balance is not None:
-                margin_sell = {"balance": balance, "change": change, "date": row["date"]}
-        if margin_buy is None:
-            balance, change = _parse_balance_cell(row["buy"])
-            if balance is not None:
-                margin_buy = {"balance": balance, "change": change, "date": row["date"]}
-        if margin_sell is not None and margin_buy is not None:
-            break
+        sell_balance, sell_change = _parse_balance_cell(row["sell"])
+        buy_balance, buy_change = _parse_balance_cell(row["buy"])
+        if margin_sell is None and sell_balance is not None:
+            margin_sell = {"balance": sell_balance, "change": sell_change, "date": row["date"]}
+        if margin_buy is None and buy_balance is not None:
+            margin_buy = {"balance": buy_balance, "change": buy_change, "date": row["date"]}
+        if sell_balance is not None or buy_balance is not None:
+            ratio = (buy_balance / sell_balance) if sell_balance else None
+            margin_history.append({
+                "date": row["date"],
+                "sell_balance": sell_balance, "sell_change": sell_change,
+                "buy_balance": buy_balance, "buy_change": buy_change,
+                "ratio": ratio,
+            })
+    margin_history.reverse()  # 古い→新しい順
+
+    daily_change_history = []
+    for row in rows:
+        zenzougen = _parse_signed_int(row["zenzougen"])
+        if not zenzougen:  # None または 0(変化なし)は除外
+            continue
+        row_price, row_change_pct = _parse_price_cell(row["price"])
+        daily_change_history.append({
+            "date": row["date"], "price": row_price, "change_pct": row_change_pct, "zenzougen": zenzougen,
+        })
+    daily_change_history.reverse()  # 古い→新しい順
 
     return {
         "date": latest["date"],
@@ -240,6 +280,8 @@ def fetch_short_selling(code: str, page) -> dict:
         "short_positions": short_positions,
         "margin_sell": margin_sell,
         "margin_buy": margin_buy,
+        "margin_history": margin_history,
+        "daily_change_history": daily_change_history,
     }
 
 
@@ -264,41 +306,85 @@ def fetch_all_short_selling(codes: list) -> dict:
     return result
 
 
-def fetch_rsi(code: str) -> dict:
+def fetch_technical_indicators(code: str) -> dict:
     """
-    nikkeiyosoku.com のRSIページ(静的HTML)からRSI時系列テーブルの最新行を取得する。
+    nikkeiyosoku.com のテクニカル分析ページ(静的HTML)から、
+    移動平均乖離・RSI/MACD等の指標・市場区分を取得する。
     """
-    url = f"https://nikkeiyosoku.com/stock/technical/rsi/{code}/"
+    empty = {
+        "market": None, "price_change": None,
+        "ma_deviation": {}, "indicators": [], "summary_counts": {},
+    }
+
+    url = f"https://nikkeiyosoku.com/stock/technical/{code}/"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    table = None
-    for t in soup.find_all("table"):
-        head_cells = [th.get_text(strip=True) for th in t.select("thead th")]
-        if head_cells == ["日付", "終値", "前日比", "前日比％", "RSI"]:
-            table = t
-            break
+    result = dict(empty)
+    result["ma_deviation"] = {}
+    result["indicators"] = []
+    result["summary_counts"] = {}
 
-    if table is None:
-        print(f"[WARN] {code}: RSIテーブルが見つかりませんでした。サイト構造が変わった可能性があります。")
-        return {"rsi": None, "rsi_date": None}
+    # 前日比(円)。%はstockscope側の値を使うのでここでは絶対値のみ利用する。
+    price_texts = soup.select(".stockprice-text")
+    if len(price_texts) >= 2:
+        change_span = price_texts[1].find("span")
+        if change_span:
+            m = re.match(r"([+-][\d,.]+)\([+-]?[\d.]+%\)", change_span.get_text(strip=True))
+            if m:
+                try:
+                    result["price_change"] = float(m.group(1).replace(",", ""))
+                except ValueError:
+                    result["price_change"] = None
 
-    first_row = table.select_one("tbody tr")
-    if first_row is None:
-        return {"rsi": None, "rsi_date": None}
+    market_span = soup.select_one(
+        ".st-h1-market .listed-prime, .st-h1-market .listed-standard, .st-h1-market .listed-growth"
+    )
+    if market_span:
+        result["market"] = "東証" + market_span.get_text(strip=True)
 
-    cells = [td.get_text(strip=True) for td in first_row.find_all("td")]
-    if len(cells) < 5:
-        return {"rsi": None, "rsi_date": None}
+    ma_list = soup.select_one("ul.fore-list-arrow")
+    if ma_list:
+        periods = ["5日", "25日", "75日", "200日"]
+        for period, li in zip(periods, ma_list.find_all("li")):
+            value_tag = li.find("div", class_=lambda c: c in ("fall", "rise"))
+            if value_tag:
+                result["ma_deviation"][period] = value_tag.get_text(strip=True)
 
-    date_str, _close, _change, _change_pct, rsi_str = cells[:5]
-    try:
-        rsi = float(rsi_str)
-    except ValueError:
-        rsi = None
+    table = soup.select_one("table.tb-teck")
+    if table:
+        for tr in table.select("tbody tr"):
+            th = tr.find("th")
+            tds = tr.find_all("td")
+            if not th or len(tds) < 2:
+                continue
+            name_link = th.find("a")
+            if not name_link or not name_link.contents:
+                continue
+            name = str(name_link.contents[0]).replace("\xa0", " ").strip()
+            value_text = tds[0].get_text(strip=True)
+            judge_span = tds[1].find("span")
+            judge = judge_span.get_text(strip=True) if judge_span else None
+            judge_class = judge_span.get("class", [None])[0] if judge_span else None
+            result["indicators"].append({
+                "name": name, "value": value_text or None, "judge": judge, "judge_class": judge_class,
+            })
 
-    return {"rsi": rsi, "rsi_date": date_str}
+    fall = soup.select_one(".number-fall")
+    neutral = soup.select_one(".number-neutral")
+    rise = soup.select_one(".number-rise")
+    if fall and neutral and rise:
+        try:
+            result["summary_counts"] = {
+                "sell": int(fall.get_text(strip=True)),
+                "neutral": int(neutral.get_text(strip=True)),
+                "buy": int(rise.get_text(strip=True)),
+            }
+        except ValueError:
+            pass
+
+    return result
 
 
 def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
@@ -307,13 +393,23 @@ def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
     snap.price = short_data.get("price")
     snap.change_pct = short_data.get("change_pct")
     snap.volume = short_data.get("volume")
-    snap.short_positions = short_data.get("short_positions", [])
+    snap.short_positions = sorted(
+        short_data.get("short_positions", []), key=lambda p: p["balance"], reverse=True
+    )
+    snap.short_positions_total = (
+        sum(p["balance"] for p in snap.short_positions) if snap.short_positions else None
+    )
+    snap.daily_change_history = short_data.get("daily_change_history", [])
     snap.margin_sell = short_data.get("margin_sell")
     snap.margin_buy = short_data.get("margin_buy")
+    snap.margin_history = short_data.get("margin_history", [])
 
-    rsi_data = fetch_rsi(ticker["code"])
-    snap.rsi = rsi_data.get("rsi")
-    snap.rsi_date = rsi_data.get("rsi_date")
+    tech_data = fetch_technical_indicators(ticker["code"])
+    snap.market = tech_data.get("market")
+    snap.price_change = tech_data.get("price_change")
+    snap.ma_deviation = tech_data.get("ma_deviation", {})
+    snap.indicators = tech_data.get("indicators", [])
+    snap.summary_counts = tech_data.get("summary_counts", {})
     return snap
 
 
@@ -325,48 +421,291 @@ def _fmt_balance(item):
     return f"{item['balance']:,} {change_str} [{item['date']}時点]"
 
 
+def _judge_css_class(judge_class):
+    if judge_class == "buy":
+        return "buy"
+    if judge_class == "sell":
+        return "sell"
+    return "neutral"
+
+
+REPORT_CSS = """
+  :root {
+    --bg: #f6f5f2;
+    --panel: #ffffff;
+    --ink: #1c1b19;
+    --ink-soft: #5c5850;
+    --line: #e4e1da;
+    --accent: #2b5d5a;
+    --buy: #1a7f4b;
+    --buy-bg: #e5f5ec;
+    --sell: #b5322b;
+    --sell-bg: #fbeae9;
+    --neutral: #8a6d1f;
+    --neutral-bg: #f6f0dd;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15181a; --panel: #1d2124; --ink: #ece9e3; --ink-soft: #a3a099;
+      --line: #33383b; --accent: #6fb8ae; --buy: #4fd18b; --buy-bg: #16332480;
+      --sell: #ff8a80; --sell-bg: #3a191680; --neutral: #e0c66b; --neutral-bg: #332d1480;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15181a; --panel: #1d2124; --ink: #ece9e3; --ink-soft: #a3a099;
+    --line: #33383b; --accent: #6fb8ae; --buy: #4fd18b; --buy-bg: #16332480;
+    --sell: #ff8a80; --sell-bg: #3a191680; --neutral: #e0c66b; --neutral-bg: #332d1480;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+    line-height: 1.6; padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.page-head { margin-bottom: 28px; }
+  header.page-head .date { font-size: 13px; color: var(--ink-soft); letter-spacing: 0.02em; }
+  header.page-head h1 { font-size: 26px; margin: 4px 0 0; font-weight: 700; }
+  section.stock {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 20px 20px 24px; margin-bottom: 24px;
+  }
+  .stock-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    flex-wrap: wrap; gap: 8px 16px; border-bottom: 1px solid var(--line);
+    padding-bottom: 14px; margin-bottom: 18px;
+  }
+  .stock-head h2 { font-size: 20px; margin: 0; }
+  .stock-head .code { color: var(--ink-soft); font-family: var(--mono); font-size: 13px; }
+  .price-line { font-family: var(--mono); font-size: 15px; }
+  .price-line .px { font-size: 20px; font-weight: 700; margin-right: 8px; }
+  .up { color: var(--buy); }
+  .down { color: var(--sell); }
+  .sell-text { color: var(--sell); font-weight: 700; }
+  .buy-text { color: var(--buy); font-weight: 700; }
+  h3.sub {
+    font-size: 13px; color: var(--ink-soft); margin: 22px 0 10px;
+    font-weight: 600; letter-spacing: 0.01em;
+  }
+  h3.sub:first-of-type { margin-top: 0; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; display: flex;
+    flex-direction: column; gap: 2px; min-width: 108px; border: 1px solid var(--line);
+  }
+  .chip .label { color: var(--ink-soft); font-size: 11px; }
+  .chip .val { font-family: var(--mono); font-weight: 700; font-size: 15px; }
+  .chip.buy { background: var(--buy-bg); border-color: transparent; }
+  .chip.buy .val { color: var(--buy); }
+  .chip.sell { background: var(--sell-bg); border-color: transparent; }
+  .chip.sell .val { color: var(--sell); }
+  .chip.neutral { background: var(--neutral-bg); border-color: transparent; }
+  .chip.neutral .val { color: var(--neutral); }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; min-width: 420px; }
+  th, td { padding: 8px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink-soft); font-weight: 600; font-size: 12px; background: color-mix(in srgb, var(--line) 35%, transparent); }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-family: var(--mono); }
+  .tag { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px; }
+  .tag.buy { background: var(--buy-bg); color: var(--buy); }
+  .tag.sell { background: var(--sell-bg); color: var(--sell); }
+  .tag.neutral { background: var(--neutral-bg); color: var(--neutral); }
+  .note { font-size: 12.5px; color: var(--ink-soft); margin-top: 10px; }
+  .summary-box {
+    border-left: 3px solid var(--accent); padding: 10px 14px;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-radius: 0 6px 6px 0; font-size: 13.5px; margin-top: 18px;
+  }
+  footer { max-width: 880px; margin: 20px auto 0; font-size: 11.5px; color: var(--ink-soft); text-align: center; }
+"""
+
+
+def _render_stock_section(s: StockSnapshot) -> str:
+    up_down = "up" if (s.change_pct or 0) >= 0 else "down"
+    price_change_str = ""
+    if s.price_change is not None and s.change_pct is not None:
+        price_change_str = f"{s.price_change:+.0f} ({s.change_pct:+.2f}%)"
+    elif s.change_pct is not None:
+        price_change_str = f"{s.change_pct:+.2f}%"
+    price_str = f"{s.price:,}円" if s.price is not None else "取得失敗"
+    code_line = f"{s.code}" + (f" ・ {s.market}" if s.market else "")
+
+    # --- テクニカル(チップ) ---
+    chips = [ind for ind in s.indicators if ind.get("value")]
+    chip_html = "".join(
+        f'<div class="chip {_judge_css_class(ind["judge_class"])}">'
+        f'<span class="label">{ind["name"]}</span><span class="val">{ind["value"]}</span></div>'
+        for ind in chips
+    ) or '<p class="note">テクニカル指標を取得できませんでした。</p>'
+
+    ma_note = " / ".join(f"{period} {val}" for period, val in s.ma_deviation.items() if val)
+    ma_note_html = f'<p class="note">移動平均乖離: {ma_note}</p>' if ma_note else ""
+
+    # --- 大口空売り残高 ---
+    if s.short_positions:
+        short_rows = "".join(
+            f"<tr><td>{p['firm']}</td><td class='num'>{p['balance']:,}</td>"
+            f"<td class='num'>{p['date']}</td></tr>"
+            for p in s.short_positions
+        )
+        total_row = (
+            f"<tr><td><strong>合計(概算)</strong></td>"
+            f"<td class='num'><strong>{s.short_positions_total:,}株</strong></td><td class='num'>—</td></tr>"
+        )
+        short_table = f"""
+        <h3 class="sub">大口空売り残高(機関投資家・最新判明分)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>機関</th><th>残高(株)</th><th>更新日</th></tr>
+            {short_rows}{total_row}
+          </table>
+        </div>
+        """
+    else:
+        short_table = '<h3 class="sub">大口空売り残高</h3><p class="note">大口空売りデータなし</p>'
+
+    # --- 空売り残の日次増減 ---
+    if s.daily_change_history:
+        change_rows = []
+        for h in s.daily_change_history:
+            price_disp = f"{h['price']:,}円" if h["price"] is not None else "-"
+            pct_cls = "up" if (h["change_pct"] or 0) >= 0 else "down"
+            pct_disp = f"{h['change_pct']:+.2f}%" if h["change_pct"] is not None else "-"
+            zz_cls = "sell-text" if h["zenzougen"] > 0 else "buy-text"
+            change_rows.append(
+                f"<tr><td>{h['date']}</td><td class='num'>{price_disp}</td>"
+                f"<td class='num {pct_cls}'>{pct_disp}</td>"
+                f"<td class='num {zz_cls}'>{h['zenzougen']:+,}</td></tr>"
+            )
+        change_table = f"""
+        <h3 class="sub">空売り残の変動経緯(全機関・日次純増減)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>日付</th><th>株価</th><th>前日比</th><th>空売り全体増減</th></tr>
+            {''.join(change_rows)}
+          </table>
+        </div>
+        """
+    else:
+        change_table = ""
+
+    # --- 個人信用残高(週次) ---
+    if s.margin_history:
+        has_ratio = any(m["ratio"] for m in s.margin_history)
+        header_cols = "<th>日付</th><th>売り残</th><th>買い残</th>" + ("<th>倍率</th>" if has_ratio else "")
+        margin_rows = []
+        for m in s.margin_history:
+            sell_disp = f"{m['sell_balance']:,}" if m["sell_balance"] is not None else "-"
+            buy_disp = f"{m['buy_balance']:,}" if m["buy_balance"] is not None else "-"
+            if has_ratio:
+                ratio_cell = f"<td class='num'>{m['ratio']:.2f}倍</td>" if m["ratio"] else "<td class='num'>-</td>"
+            else:
+                ratio_cell = ""
+            margin_rows.append(
+                f"<tr><td>{m['date']}</td><td class='num'>{sell_disp}</td>"
+                f"<td class='num'>{buy_disp}</td>{ratio_cell}</tr>"
+            )
+        margin_table = f"""
+        <h3 class="sub">個人信用残高(週次)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr>{header_cols}</tr>
+            {''.join(margin_rows)}
+          </table>
+        </div>
+        """
+    else:
+        margin_table = ""
+
+    # --- サマリー(機械的に算出できる事実のみ。ニュース等の定性コメントは含めない) ---
+    summary_tags = []
+    counts = s.summary_counts
+    if counts.get("buy") is not None:
+        summary_tags.append(f'<span class="tag buy">買いシグナル {counts["buy"]}</span>')
+    if counts.get("neutral") is not None:
+        summary_tags.append(f'<span class="tag neutral">中立 {counts["neutral"]}</span>')
+    if counts.get("sell") is not None:
+        summary_tags.append(f'<span class="tag sell">売りシグナル {counts["sell"]}</span>')
+
+    summary_facts = []
+    if s.short_positions_total:
+        summary_facts.append(
+            f"大口空売り残高 合計(概算): {s.short_positions_total:,}株({len(s.short_positions)}社が最新判明分)"
+        )
+    if s.margin_history:
+        latest_margin = s.margin_history[-1]
+        ratio_text = f" / 倍率 {latest_margin['ratio']:.2f}倍" if latest_margin["ratio"] else ""
+        summary_facts.append(
+            f"個人信用(直近 {latest_margin['date']}時点): "
+            f"売り残 {latest_margin['sell_balance']:,} / 買い残 {latest_margin['buy_balance']:,}{ratio_text}"
+        )
+
+    summary_box = ""
+    if summary_tags or summary_facts:
+        summary_box = (
+            '<div class="summary-box">'
+            + "".join(summary_tags)
+            + ("<br><br>" if summary_tags and summary_facts else "")
+            + "<br>".join(summary_facts)
+            + "</div>"
+        )
+
+    return f"""
+    <section class="stock">
+      <div class="stock-head">
+        <div>
+          <h2>{s.name}</h2>
+          <span class="code">{code_line}</span>
+        </div>
+        <div class="price-line">
+          <span class="px">{price_str}</span>
+          <span class="{up_down}">{price_change_str}</span>
+        </div>
+      </div>
+
+      <h3 class="sub">テクニカル</h3>
+      <div class="chip-row">{chip_html}</div>
+      {ma_note_html}
+
+      {short_table}
+      {change_table}
+      {margin_table}
+      {summary_box}
+    </section>
+    """
+
+
 def render_html_report(snapshots: list) -> str:
     """
     需給ウォッチのHTMLレポートを組み立てる。
     """
     today = datetime.now().strftime("%Y年%m月%d日")
-    sections = []
-    for s in snapshots:
-        if s.short_positions:
-            row_htmls = []
-            for p in s.short_positions:
-                change_str = f"{p['change']:+,}" if p["change"] is not None else "-"
-                row_htmls.append(
-                    f"<tr><td>{p['firm']}</td><td>{p['balance']:,}</td>"
-                    f"<td>{change_str}</td><td>{p['date']}</td></tr>"
-                )
-            rows = "".join(row_htmls)
-        else:
-            rows = "<tr><td colspan='4'>大口空売りデータなし</td></tr>"
-
-        price_str = f"{s.price:,}円" if s.price is not None else "取得失敗"
-        change_str = f"{s.change_pct:+.2f}%" if s.change_pct is not None else "-"
-        rsi_str = f"{s.rsi:.2f} ({s.rsi_date})" if s.rsi is not None else "取得失敗"
-
-        sections.append(f"""
-        <section>
-          <h2>{s.name} ({s.code})</h2>
-          <p>株価: {price_str} ({change_str}) [{s.date or "-"}時点] / RSI: {rsi_str}</p>
-          <p>個人信用 売残: {_fmt_balance(s.margin_sell)}</p>
-          <p>個人信用 買残: {_fmt_balance(s.margin_buy)}</p>
-          <table border="1" cellspacing="0" cellpadding="4">
-            <tr><th>機関</th><th>残高</th><th>増減</th><th>日付</th></tr>
-            {rows}
-          </table>
-        </section>
-        """)
+    sections = "".join(_render_stock_section(s) for s in snapshots)
 
     return f"""<!DOCTYPE html>
-<html lang="ja"><head><meta charset="UTF-8"><title>需給ウォッチ {today}</title></head>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>需給ウォッチ — {today}</title>
+<style>{REPORT_CSS}</style>
+</head>
 <body>
-<h1>需給ウォッチ {today}</h1>
-{''.join(sections)}
-</body></html>"""
+<div class="wrap">
+  <header class="page-head">
+    <div class="date">{today} 終値ベース</div>
+    <h1>需給ウォッチ</h1>
+  </header>
+  {sections}
+  <footer>
+    データ出典:株ビジョン(stockscope.app)、投資の森(nikkeiyosoku.com)の公開情報をもとに自動生成した参考資料です。投資判断はご自身でお願いします。
+  </footer>
+</div>
+</body>
+</html>"""
 
 
 def render_discord_message(snapshots: list, report_url: str) -> str:
@@ -379,7 +718,8 @@ def render_discord_message(snapshots: list, report_url: str) -> str:
     for s in snapshots:
         price_str = f"{s.price:,}円" if s.price is not None else "取得失敗"
         change_str = f"{s.change_pct:+.2f}%" if s.change_pct is not None else "-"
-        rsi_str = f"{s.rsi:.2f}" if s.rsi is not None else "取得失敗"
+        rsi = next((i["value"] for i in s.indicators if i["name"].startswith("RSI")), None)
+        rsi_str = rsi if rsi else "取得失敗"
         lines.append(f"{s.name} ({s.code}): {price_str} ({change_str}) / RSI {rsi_str}")
 
     lines.append("")
