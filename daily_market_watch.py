@@ -32,6 +32,7 @@
   取得に失敗した場合はブラウザの「検証」機能で構造を再確認すること。
 """
 
+import os
 import re
 import requests
 from bs4 import BeautifulSoup
@@ -55,6 +56,13 @@ TICKERS = [
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; PersonalResearchBot/1.0)"
 }
+
+# レポートをGitHub Pagesで公開する際のベースURL。
+# reports/YYYY-MM-DD.html を push すると https://<user>.github.io/<repo>/reports/YYYY-MM-DD.html で閲覧できる。
+REPORT_BASE_URL = os.environ.get(
+    "REPORT_BASE_URL",
+    "https://echu112000-bit.github.io/daily-market-watch/reports",
+)
 
 # stockscope.app のレンダリング後DOMから表データを抜き出すJS。
 # 仮想テーブルの計測用の非表示行(日付列が日付形式でない)は除外する。
@@ -361,20 +369,50 @@ def render_html_report(snapshots: list) -> str:
 </body></html>"""
 
 
-def notify(report_html: str):
+def render_discord_message(snapshots: list, report_url: str) -> str:
     """
-    通知の送信先はここに実装する。例:
-      - メール送信(smtplib)
-      - Slack Incoming Webhook
-      - LINE公式アカウント Messaging API
-    まずはローカルにファイル保存するだけの最小実装にしてある。
+    Discord Webhook向けの短いサマリー + 詳細レポートへのリンクを組み立てる。
+    詳細(機関別の残高など)はリンク先のHTMLレポートで確認する想定。
     """
-    output_path = f"report_{datetime.now().strftime('%Y%m%d')}.html"
+    today = datetime.now().strftime("%Y年%m月%d日")
+    lines = [f"**需給ウォッチ {today}**", ""]
+    for s in snapshots:
+        price_str = f"{s.price:,}円" if s.price is not None else "取得失敗"
+        change_str = f"{s.change_pct:+.2f}%" if s.change_pct is not None else "-"
+        rsi_str = f"{s.rsi:.2f}" if s.rsi is not None else "取得失敗"
+        lines.append(f"{s.name} ({s.code}): {price_str} ({change_str}) / RSI {rsi_str}")
+
+    lines.append("")
+    lines.append(f"詳細レポート: {report_url}")
+    return "\n".join(lines)
+
+
+def send_discord_notification(webhook_url: str, snapshots: list, report_url: str):
+    content = render_discord_message(snapshots, report_url)
+    resp = requests.post(webhook_url, json={"content": content}, timeout=15)
+    if resp.status_code >= 300:
+        print(f"[WARN] Discord通知に失敗しました: {resp.status_code} {resp.text}")
+
+
+def notify(report_html: str, snapshots: list):
+    """
+    レポートを reports/YYYY-MM-DD.html として保存する(GitHub Pagesで公開する前提)。
+    DISCORD_WEBHOOK_URL が設定されていれば、要点とレポートへのリンクをDiscordに通知する。
+    """
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    os.makedirs("reports", exist_ok=True)
+    output_path = os.path.join("reports", f"{date_str}.html")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(report_html)
     print(f"レポートを {output_path} に保存しました。")
 
-    # TODO: ここにSlack/メール/LINE通知の実装を追加する
+    report_url = f"{REPORT_BASE_URL}/{date_str}.html"
+
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if webhook_url:
+        send_discord_notification(webhook_url, snapshots, report_url)
+    else:
+        print("[INFO] DISCORD_WEBHOOK_URL が未設定のため、Discord通知はスキップしました。")
 
 
 def main():
@@ -386,7 +424,7 @@ def main():
         for t in TICKERS
     ]
     report_html = render_html_report(snapshots)
-    notify(report_html)
+    notify(report_html, snapshots)
 
 
 if __name__ == "__main__":
