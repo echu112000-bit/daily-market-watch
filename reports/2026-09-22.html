@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>需給ウォッチ — 2026年09月22日</title>
+<style>
+  :root {
+    --bg: #f6f5f2;
+    --panel: #ffffff;
+    --ink: #1c1b19;
+    --ink-soft: #5c5850;
+    --line: #e4e1da;
+    --accent: #2b5d5a;
+    --buy: #1a7f4b;
+    --buy-bg: #e5f5ec;
+    --sell: #b5322b;
+    --sell-bg: #fbeae9;
+    --neutral: #8a6d1f;
+    --neutral-bg: #f6f0dd;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15181a; --panel: #1d2124; --ink: #ece9e3; --ink-soft: #a3a099;
+      --line: #33383b; --accent: #6fb8ae; --buy: #4fd18b; --buy-bg: #16332480;
+      --sell: #ff8a80; --sell-bg: #3a191680; --neutral: #e0c66b; --neutral-bg: #332d1480;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15181a; --panel: #1d2124; --ink: #ece9e3; --ink-soft: #a3a099;
+    --line: #33383b; --accent: #6fb8ae; --buy: #4fd18b; --buy-bg: #16332480;
+    --sell: #ff8a80; --sell-bg: #3a191680; --neutral: #e0c66b; --neutral-bg: #332d1480;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+    line-height: 1.6; padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header.page-head { margin-bottom: 28px; }
+  header.page-head .date { font-size: 13px; color: var(--ink-soft); letter-spacing: 0.02em; }
+  header.page-head h1 { font-size: 26px; margin: 4px 0 0; font-weight: 700; }
+  section.stock {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 20px 20px 24px; margin-bottom: 24px;
+  }
+  .stock-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    flex-wrap: wrap; gap: 8px 16px; border-bottom: 1px solid var(--line);
+    padding-bottom: 14px; margin-bottom: 18px;
+  }
+  .stock-head h2 { font-size: 20px; margin: 0; }
+  .stock-head .code { color: var(--ink-soft); font-family: var(--mono); font-size: 13px; }
+  .price-line { font-family: var(--mono); font-size: 15px; }
+  .price-line .px { font-size: 20px; font-weight: 700; margin-right: 8px; }
+  .up { color: var(--buy); }
+  .down { color: var(--sell); }
+  .sell-text { color: var(--sell); font-weight: 700; }
+  .buy-text { color: var(--buy); font-weight: 700; }
+  h3.sub {
+    font-size: 13px; color: var(--ink-soft); margin: 22px 0 10px;
+    font-weight: 600; letter-spacing: 0.01em;
+  }
+  h3.sub:first-of-type { margin-top: 0; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; display: flex;
+    flex-direction: column; gap: 2px; min-width: 108px; border: 1px solid var(--line);
+  }
+  .chip .label { color: var(--ink-soft); font-size: 11px; }
+  .chip .val { font-family: var(--mono); font-weight: 700; font-size: 15px; }
+  .chip.buy { background: var(--buy-bg); border-color: transparent; }
+  .chip.buy .val { color: var(--buy); }
+  .chip.sell { background: var(--sell-bg); border-color: transparent; }
+  .chip.sell .val { color: var(--sell); }
+  .chip.neutral { background: var(--neutral-bg); border-color: transparent; }
+  .chip.neutral .val { color: var(--neutral); }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; min-width: 420px; }
+  th, td { padding: 8px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink-soft); font-weight: 600; font-size: 12px; background: color-mix(in srgb, var(--line) 35%, transparent); }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-family: var(--mono); }
+  .tag { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px; }
+  .tag.buy { background: var(--buy-bg); color: var(--buy); }
+  .tag.sell { background: var(--sell-bg); color: var(--sell); }
+  .tag.neutral { background: var(--neutral-bg); color: var(--neutral); }
+  .note { font-size: 12.5px; color: var(--ink-soft); margin-top: 10px; }
+  .summary-box {
+    border-left: 3px solid var(--accent); padding: 10px 14px;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-radius: 0 6px 6px 0; font-size: 13.5px; margin-top: 18px;
+  }
+  footer { max-width: 880px; margin: 20px auto 0; font-size: 11.5px; color: var(--ink-soft); text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="page-head">
+    <div class="date">2026年09月22日 終値ベース</div>
+    <h1>需給ウォッチ</h1>
+  </header>
+  
+    <section class="stock">
+      <div class="stock-head">
+        <div>
+          <h2>メルカリ</h2>
+          <span class="code">4385 ・ 東証プライム</span>
+        </div>
+        <div class="price-line">
+          <span class="px">3,699円</span>
+          <span class="up">+27 (+0.74%)</span>
+        </div>
+      </div>
+
+      <h3 class="sub">テクニカル</h3>
+      <div class="chip-row"><div class="chip buy"><span class="label">移動平均乖離率 (25)</span><span class="val">-13.79</span></div><div class="chip buy"><span class="label">RSI (14)</span><span class="val">20.74</span></div><div class="chip neutral"><span class="label">MACD (12,26)</span><span class="val">-221.50</span></div><div class="chip sell"><span class="label">モメンタム (15)</span><span class="val">-918.0</span></div><div class="chip neutral"><span class="label">サイコロジカル (12)</span><span class="val">41.7</span></div></div>
+      <p class="note">移動平均乖離: 5日 -1.33% / 25日 -13.79% / 75日 -13.58% / 200日 -2.41%</p>
+
+      
+        <h3 class="sub">大口空売り残高(機関投資家・最新判明分)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>機関</th><th>残高(株)</th><th>更新日</th></tr>
+            <tr><td>JPM Securities Japan Co Ltd.</td><td class='num'>2,293,397</td><td class='num'>2026-09-08(火)</td></tr><tr><td>三菱ＵＦＪモルガン・スタンレー証券株式会社</td><td class='num'>2,179,215</td><td class='num'>2026-09-16(水)</td></tr><tr><td>GOLDMAN SACHS INTERNATIONAL</td><td class='num'>2,039,083</td><td class='num'>2026-09-16(水)</td></tr><tr><td>Nomura International plc</td><td class='num'>1,520,435</td><td class='num'>2026-09-09(水)</td></tr><tr><td>Citigroup Global Markets Limited</td><td class='num'>1,176,910</td><td class='num'>2026-09-10(木)</td></tr><tr><td>Barclays Bank PLC</td><td class='num'>745,002</td><td class='num'>2026-09-01(火)</td></tr><tr><td>Societe Generale</td><td class='num'>480,959</td><td class='num'>2026-09-02(水)</td></tr><tr><td><strong>合計(概算)</strong></td><td class='num'><strong>10,435,001株</strong></td><td class='num'>—</td></tr>
+          </table>
+        </div>
+        <p class="note">発行済株式数に対する比率(概算): <strong>約6.3%</strong>(時価総額÷株価から逆算した約1.65億株ベース)</p>
+        
+      
+        <h3 class="sub">空売り残の変動経緯(全機関・日次純増減)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>日付</th><th>株価</th><th>前日比</th><th>空売り全体増減</th></tr>
+            <tr><td>2026-08-24(月)</td><td class='num'>4,474円</td><td class='num down'>-5.71%</td><td class='num sell-text'>+45,298</td></tr><tr><td>2026-08-26(水)</td><td class='num'>4,568円</td><td class='num up'>+2.51%</td><td class='num sell-text'>+248,220</td></tr><tr><td>2026-08-28(金)</td><td class='num'>4,617円</td><td class='num up'>+0.52%</td><td class='num sell-text'>+750,352</td></tr><tr><td>2026-08-31(月)</td><td class='num'>4,633円</td><td class='num up'>+0.35%</td><td class='num buy-text'>-361,630</td></tr><tr><td>2026-09-01(火)</td><td class='num'>4,619円</td><td class='num down'>-0.30%</td><td class='num buy-text'>-103,170</td></tr><tr><td>2026-09-02(水)</td><td class='num'>4,250円</td><td class='num down'>-7.99%</td><td class='num sell-text'>+1,082,521</td></tr><tr><td>2026-09-03(木)</td><td class='num'>4,340円</td><td class='num up'>+2.12%</td><td class='num sell-text'>+54,881</td></tr><tr><td>2026-09-04(金)</td><td class='num'>4,443円</td><td class='num up'>+2.37%</td><td class='num sell-text'>+647,158</td></tr><tr><td>2026-09-07(月)</td><td class='num'>4,340円</td><td class='num down'>-2.32%</td><td class='num sell-text'>+830,366</td></tr><tr><td>2026-09-08(火)</td><td class='num'>4,100円</td><td class='num down'>-5.53%</td><td class='num sell-text'>+825,143</td></tr><tr><td>2026-09-09(水)</td><td class='num'>3,967円</td><td class='num down'>-3.24%</td><td class='num sell-text'>+116,472</td></tr><tr><td>2026-09-10(木)</td><td class='num'>3,921円</td><td class='num down'>-1.16%</td><td class='num sell-text'>+468,864</td></tr><tr><td>2026-09-14(月)</td><td class='num'>3,886円</td><td class='num up'>+1.57%</td><td class='num sell-text'>+198,898</td></tr><tr><td>2026-09-15(火)</td><td class='num'>3,867円</td><td class='num down'>-0.49%</td><td class='num sell-text'>+188,258</td></tr><tr><td>2026-09-16(水)</td><td class='num'>3,621円</td><td class='num down'>-6.36%</td><td class='num sell-text'>+726,242</td></tr>
+          </table>
+        </div>
+        
+      
+        <h3 class="sub">個人信用残高(週次)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>日付</th><th>売り残</th><th>買い残</th><th>倍率</th></tr>
+            <tr><td>2026-08-28(金)</td><td class='num'>222,300</td><td class='num'>578,300</td><td class='num'>2.60倍</td></tr><tr><td>2026-09-04(金)</td><td class='num'>183,100</td><td class='num'>709,300</td><td class='num'>3.87倍</td></tr><tr><td>2026-09-11(金)</td><td class='num'>151,800</td><td class='num'>1,164,800</td><td class='num'>7.67倍</td></tr>
+          </table>
+        </div>
+        
+      <div class="summary-box"><span class="tag buy">買いシグナル 2</span><span class="tag neutral">中立 5</span><span class="tag sell">売りシグナル 0</span><br><br>大口空売り残高 合計(概算): 10,435,001株(7社が最新判明分) / 発行済株式数比6.3%<br>個人信用(直近 2026-09-11(金)時点): 売り残 151,800 / 買い残 1,164,800 / 倍率 7.67倍</div>
+    </section>
+    
+    <section class="stock">
+      <div class="stock-head">
+        <div>
+          <h2>santec Holdings</h2>
+          <span class="code">6777 ・ 東証スタンダード</span>
+        </div>
+        <div class="price-line">
+          <span class="px">21,050円</span>
+          <span class="up">+1330 (+6.74%)</span>
+        </div>
+      </div>
+
+      <h3 class="sub">テクニカル</h3>
+      <div class="chip-row"><div class="chip sell"><span class="label">移動平均乖離率 (25)</span><span class="val">9.37</span></div><div class="chip neutral"><span class="label">RSI (14)</span><span class="val">57.00</span></div><div class="chip neutral"><span class="label">MACD (12,26)</span><span class="val">92.50</span></div><div class="chip buy"><span class="label">モメンタム (15)</span><span class="val">1910.0</span></div><div class="chip neutral"><span class="label">サイコロジカル (12)</span><span class="val">58.3</span></div></div>
+      <p class="note">移動平均乖離: 5日 +7.68% / 25日 +9.37% / 75日 -1.05% / 200日 +8.79%</p>
+
+      
+        <h3 class="sub">大口空売り残高(機関投資家・最新判明分)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>機関</th><th>残高(株)</th><th>更新日</th></tr>
+            <tr><td>MERRILL LYNCH INTERNATIONAL</td><td class='num'>103,627</td><td class='num'>2026-09-16(水)</td></tr><tr><td>GOLDMAN SACHS INTERNATIONAL</td><td class='num'>59,296</td><td class='num'>2026-08-25(火)</td></tr><tr><td>モルガン・スタンレーMUFG証券株式会社</td><td class='num'>56,887</td><td class='num'>2026-09-09(水)</td></tr><tr><td>Barclays Capital Securities Ltd</td><td class='num'>45,700</td><td class='num'>2026-09-10(木)</td></tr><tr><td><strong>合計(概算)</strong></td><td class='num'><strong>265,510株</strong></td><td class='num'>—</td></tr>
+          </table>
+        </div>
+        <p class="note">発行済株式数に対する比率(概算): <strong>約2.2%</strong>(時価総額÷株価から逆算した約0.12億株ベース)</p>
+        
+      
+        <h3 class="sub">空売り残の変動経緯(全機関・日次純増減)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>日付</th><th>株価</th><th>前日比</th><th>空売り全体増減</th></tr>
+            <tr><td>2026-08-24(月)</td><td class='num'>18,600円</td><td class='num up'>+1.81%</td><td class='num buy-text'>-15,796</td></tr><tr><td>2026-08-25(火)</td><td class='num'>19,550円</td><td class='num up'>+5.11%</td><td class='num buy-text'>-13,955</td></tr><tr><td>2026-08-26(水)</td><td class='num'>18,680円</td><td class='num down'>-4.45%</td><td class='num sell-text'>+1,400</td></tr><tr><td>2026-08-27(木)</td><td class='num'>19,500円</td><td class='num up'>+4.39%</td><td class='num buy-text'>-11,100</td></tr><tr><td>2026-08-28(金)</td><td class='num'>19,140円</td><td class='num down'>-1.85%</td><td class='num sell-text'>+11,900</td></tr><tr><td>2026-08-31(月)</td><td class='num'>19,560円</td><td class='num up'>+2.19%</td><td class='num buy-text'>-5,000</td></tr><tr><td>2026-09-01(火)</td><td class='num'>19,610円</td><td class='num up'>+0.26%</td><td class='num sell-text'>+2,900</td></tr><tr><td>2026-09-02(水)</td><td class='num'>18,650円</td><td class='num down'>-4.90%</td><td class='num sell-text'>+2,600</td></tr><tr><td>2026-09-03(木)</td><td class='num'>17,910円</td><td class='num down'>-3.97%</td><td class='num sell-text'>+1,100</td></tr><tr><td>2026-09-04(金)</td><td class='num'>19,030円</td><td class='num up'>+6.25%</td><td class='num buy-text'>-19,505</td></tr><tr><td>2026-09-07(月)</td><td class='num'>20,080円</td><td class='num up'>+5.52%</td><td class='num buy-text'>-19,700</td></tr><tr><td>2026-09-08(火)</td><td class='num'>19,010円</td><td class='num down'>-5.33%</td><td class='num buy-text'>-4,400</td></tr><tr><td>2026-09-09(水)</td><td class='num'>20,270円</td><td class='num up'>+6.63%</td><td class='num buy-text'>-6,100</td></tr><tr><td>2026-09-10(木)</td><td class='num'>19,880円</td><td class='num down'>-1.92%</td><td class='num buy-text'>-17,600</td></tr><tr><td>2026-09-11(金)</td><td class='num'>19,020円</td><td class='num down'>-4.33%</td><td class='num buy-text'>-3,800</td></tr><tr><td>2026-09-14(月)</td><td class='num'>18,460円</td><td class='num down'>-2.94%</td><td class='num buy-text'>-1,400</td></tr><tr><td>2026-09-15(火)</td><td class='num'>18,950円</td><td class='num up'>+2.65%</td><td class='num buy-text'>-6,100</td></tr><tr><td>2026-09-16(水)</td><td class='num'>19,560円</td><td class='num up'>+3.22%</td><td class='num buy-text'>-2,900</td></tr>
+          </table>
+        </div>
+        
+      
+        <h3 class="sub">個人信用残高(週次)</h3>
+        <div class="table-scroll">
+          <table>
+            <tr><th>日付</th><th>売り残</th><th>買い残</th></tr>
+            <tr><td>2026-08-28(金)</td><td class='num'>0</td><td class='num'>287,900</td></tr><tr><td>2026-09-04(金)</td><td class='num'>0</td><td class='num'>280,700</td></tr><tr><td>2026-09-11(金)</td><td class='num'>0</td><td class='num'>271,900</td></tr>
+          </table>
+        </div>
+        
+      <div class="summary-box"><span class="tag buy">買いシグナル 1</span><span class="tag neutral">中立 4</span><span class="tag sell">売りシグナル 2</span><br><br>大口空売り残高 合計(概算): 265,510株(4社が最新判明分) / 発行済株式数比2.2%<br>個人信用(直近 2026-09-11(金)時点): 売り残 0 / 買い残 271,900</div>
+    </section>
+    
+  <footer>
+    データ出典:株ビジョン(stockscope.app)、投資の森(nikkeiyosoku.com)の公開情報をもとに自動生成した参考資料です。投資判断はご自身でお願いします。
+  </footer>
+</div>
+</body>
+</html>
