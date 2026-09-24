@@ -45,7 +45,20 @@ import re
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
+
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def _now_jst() -> datetime:
+    """
+    レポートの日付は常に日本時間基準にする。
+    GitHub Actionsのランナーはシステム時刻がUTCのため、datetime.now()を
+    そのまま使うと(特に日本時間の早朝に実行した場合)日付が1日ずれる。
+    """
+    return datetime.now(JST)
+
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -265,7 +278,7 @@ def fetch_short_selling(code: str, page) -> dict:
                 "buy_balance": buy_balance, "buy_change": buy_change,
                 "ratio": ratio,
             })
-    margin_history.reverse()  # 古い→新しい順
+    # rows は新しい日付が先頭のまま(降順)にしておく
 
     daily_change_history = []
     for row in rows:
@@ -276,7 +289,7 @@ def fetch_short_selling(code: str, page) -> dict:
         daily_change_history.append({
             "date": row["date"], "price": row_price, "change_pct": row_change_pct, "zenzougen": zenzougen,
         })
-    daily_change_history.reverse()  # 古い→新しい順
+    # rows は新しい日付が先頭のまま(降順)にしておく
 
     return {
         "date": latest["date"],
@@ -692,7 +705,7 @@ def _render_stock_section(s: StockSnapshot) -> str:
             f"({len(s.short_positions)}社が最新判明分){ratio_text}"
         )
     if s.margin_history:
-        latest_margin = s.margin_history[-1]
+        latest_margin = s.margin_history[0]
         ratio_text = f" / 倍率 {latest_margin['ratio']:.2f}倍" if latest_margin["ratio"] else ""
         summary_facts.append(
             f"個人信用(直近 {latest_margin['date']}時点): "
@@ -738,7 +751,7 @@ def render_html_report(snapshots: list) -> str:
     """
     需給ウォッチのHTMLレポートを組み立てる。
     """
-    today = datetime.now().strftime("%Y年%m月%d日")
+    today = _now_jst().strftime("%Y年%m月%d日")
     sections = "".join(_render_stock_section(s) for s in snapshots)
 
     return f"""<!DOCTYPE html>
@@ -769,7 +782,7 @@ def render_discord_message(snapshots: list, report_url: str) -> str:
     Discord Webhook向けの短いサマリー + 詳細レポートへのリンクを組み立てる。
     詳細(機関別の残高など)はリンク先のHTMLレポートで確認する想定。
     """
-    today = datetime.now().strftime("%Y年%m月%d日")
+    today = _now_jst().strftime("%Y年%m月%d日")
     lines = [f"**需給ウォッチ {today}**", ""]
     for s in snapshots:
         price_str = f"{s.price:,}円" if s.price is not None else "取得失敗"
@@ -795,7 +808,7 @@ def notify(report_html: str, snapshots: list):
     レポートを reports/YYYY-MM-DD.html として保存する(GitHub Pagesで公開する前提)。
     DISCORD_WEBHOOK_URL が設定されていれば、要点とレポートへのリンクをDiscordに通知する。
     """
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = _now_jst().strftime("%Y-%m-%d")
     os.makedirs("reports", exist_ok=True)
     output_path = os.path.join("reports", f"{date_str}.html")
     with open(output_path, "w", encoding="utf-8") as f:

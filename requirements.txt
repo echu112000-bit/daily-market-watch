@@ -1,3 +1,4 @@
 requests
 beautifulsoup4
 playwright
+tzdata; sys_platform == "win32"
