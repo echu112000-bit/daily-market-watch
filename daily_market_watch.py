@@ -604,14 +604,24 @@ def _render_stock_section(s: StockSnapshot) -> str:
 
     # --- 大口空売り残高 ---
     if s.short_positions:
-        short_rows = "".join(
-            f"<tr><td>{p['firm']}</td><td class='num'>{p['balance']:,}</td>"
-            f"<td class='num'>{p['date']}</td></tr>"
-            for p in s.short_positions
-        )
+        short_rows = []
+        for p in s.short_positions:
+            if p["change"] is not None:
+                change_cls = "sell-text" if p["change"] > 0 else ("buy-text" if p["change"] < 0 else "")
+                change_disp = f"{p['change']:+,}"
+            else:
+                change_cls = ""
+                change_disp = "-"
+            short_rows.append(
+                f"<tr><td>{p['firm']}</td><td class='num'>{p['balance']:,}</td>"
+                f"<td class='num {change_cls}'>{change_disp}</td>"
+                f"<td class='num'>{p['date']}</td></tr>"
+            )
+        short_rows = "".join(short_rows)
         total_row = (
             f"<tr><td><strong>合計(概算)</strong></td>"
-            f"<td class='num'><strong>{s.short_positions_total:,}株</strong></td><td class='num'>—</td></tr>"
+            f"<td class='num'><strong>{s.short_positions_total:,}株</strong></td>"
+            f"<td class='num'>—</td><td class='num'>—</td></tr>"
         )
         if s.short_ratio is not None:
             oku_shares = s.shares_outstanding / 10**8
@@ -625,7 +635,7 @@ def _render_stock_section(s: StockSnapshot) -> str:
         <h3 class="sub">大口空売り残高(機関投資家・最新判明分)</h3>
         <div class="table-scroll">
           <table>
-            <tr><th>機関</th><th>残高(株)</th><th>更新日</th></tr>
+            <tr><th>機関</th><th>残高(株)</th><th>増減</th><th>更新日</th></tr>
             {short_rows}{total_row}
           </table>
         </div>
