@@ -146,7 +146,7 @@ class StockSnapshot:
     margin_sell: dict = None                                  # {"balance","change","date"}
     margin_buy: dict = None
     margin_history: list = field(default_factory=list)        # [{"date","sell_balance","sell_change","buy_balance","buy_change","ratio"}]
-    charts: dict = field(default_factory=dict)                 # {"price":{"dates":[...],"values":[...]}, "rsi":..., "macd":..., "macd_signal":..., "kairi25":..., "kairi75":...}
+    charts: dict = field(default_factory=dict)                 # {"price":{"dates":[...],"values":[...]}, "rsi":..., "macd":..., "macd_signal":..., "sma":..., "volume":..., "volume_profile":...}
 
 
 def _parse_price_cell(text: str):
@@ -484,24 +484,21 @@ def _simple_moving_average(values: list, window: int) -> list:
 def fetch_chart_series(code: str, name: str) -> dict:
     """
     nikkeiyosoku.com が内部で使っているチャート用JSON APIから、
-    株価・RSI・MACD・移動平均乖離率(25日/75日)の時系列データを取得する。
-    (サイトのJS: stock_technical_chart / stock_kairi_chart / stock_macd_chart への
+    株価・RSI・MACDの時系列データを取得する。
+    (サイトのJS: stock_technical_chart / stock_macd_chart への
      $.ajax POST呼び出しを直接再現している)
-    移動平均線(5/25/75日)は表示期間より手前のデータも使って計算してから
+    移動平均線(25/75日)は表示期間より手前のデータも使って計算してから
     表示期間分だけ切り出すことで、表示開始直後から欠けなく描画できるようにしている。
+    (移動平均乖離率は株価チャートの移動平均線から視覚的に読み取れるため、
+     専用チャートは作らず別途テキストで表示している)
     """
     empty = {"price": {"dates": [], "values": []}, "rsi": {"dates": [], "values": []},
               "macd": {"dates": [], "values": []}, "macd_signal": {"dates": [], "values": []},
-              "kairi25": {"dates": [], "values": []}, "kairi75": {"dates": [], "values": []},
               "sma": {str(w): {"dates": [], "values": []} for w in MA_WINDOWS}}
     try:
         rsi_json = requests.post(
             "https://nikkeiyosoku.com/data/?stock_technical_chart",
             headers=HEADERS, data={"type": "rsi", "code": code, "label": name}, timeout=15,
-        ).json()
-        kairi_json = requests.post(
-            "https://nikkeiyosoku.com/data/?stock_kairi_chart",
-            headers=HEADERS, data={"code": code}, timeout=15,
         ).json()
         macd_json = requests.post(
             "https://nikkeiyosoku.com/data/?stock_macd_chart",
@@ -525,8 +522,6 @@ def fetch_chart_series(code: str, name: str) -> dict:
         "rsi": _series_from_pairs(rsi_json.get("val", [])),
         "macd": _series_from_pairs(macd_json.get("MACD", [])),
         "macd_signal": _series_from_pairs(macd_json.get("シグナル", [])),
-        "kairi25": _series_from_pairs(kairi_json.get("val", [])),
-        "kairi75": _series_from_pairs(kairi_json.get("kari75", [])),
         "sma": sma,
     }
 
@@ -753,7 +748,6 @@ def _render_stock_section(s: StockSnapshot) -> str:
           <div class="chart-box chart-tall"><div class="chart-box-title">株価(25日/75日移動平均線、右側に価格帯別出来高の概算)</div><canvas id="chart-price-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">出来高 + RSI(14)</div><canvas id="chart-volrsi-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">MACD(12,26)</div><canvas id="chart-macd-{s.code}"></canvas></div>
-          <div class="chart-box"><div class="chart-box-title">移動平均乖離率(25日/75日)</div><canvas id="chart-kairi-{s.code}"></canvas></div>
         </div>
         """
     else:
@@ -916,6 +910,9 @@ def _render_stock_section(s: StockSnapshot) -> str:
 
 
 CHART_SCRIPT = """
+const Y_AXIS_WIDTH = 54; // 全チャートの左軸幅をそろえ、数字の桁数が違っても日付軸(縦方向)が一致するようにする
+const Y_AXIS_WIDTH_RIGHT = 38;
+
 function chartColors() {
   const style = getComputedStyle(document.documentElement);
   const g = (name) => style.getPropertyValue(name).trim();
@@ -968,6 +965,7 @@ function renderLineChart(canvasId, datasets, opts) {
         grid: { color: colors.line },
         min: opts && opts.min !== undefined ? opts.min : undefined,
         max: opts && opts.max !== undefined ? opts.max : undefined,
+        afterFit: (scale) => { scale.width = Y_AXIS_WIDTH; },
       },
     },
   };
@@ -1014,8 +1012,8 @@ function renderVolumeRsiChart(canvasId, dates, volumeValues, rsiValues) {
       plugins: { legend: { display: true, labels: { color: colors.ink, boxWidth: 12, font: { size: 10 } } } },
       scales: {
         x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: colors.line } },
-        yVol: { position: 'left', ticks: { color: colors.ink, font: { size: 9 } }, grid: { display: false } },
-        yRsi: { position: 'right', min: 0, max: 100, ticks: { color: colors.ink, font: { size: 9 } }, grid: { color: colors.line } },
+        yVol: { position: 'left', ticks: { color: colors.ink, font: { size: 9 } }, grid: { display: false }, afterFit: (scale) => { scale.width = Y_AXIS_WIDTH; } },
+        yRsi: { position: 'right', min: 0, max: 100, ticks: { color: colors.ink, font: { size: 9 } }, grid: { color: colors.line }, afterFit: (scale) => { scale.width = Y_AXIS_WIDTH_RIGHT; } },
       },
     },
   });
@@ -1042,12 +1040,6 @@ document.querySelectorAll('canvas[id^="chart-price-"]').forEach(canvas => {
     renderLineChart('chart-macd-' + code, [
       { label: 'MACD', values: d.macd.values, dates: d.macd.dates, color: 'accent' },
       { label: 'シグナル', values: d.macd_signal.values, dates: d.macd_signal.dates, color: 'neutral' },
-    ]);
-  }
-  if (d.kairi25.values.length) {
-    renderLineChart('chart-kairi-' + code, [
-      { label: '25日', values: d.kairi25.values, dates: d.kairi25.dates, color: 'accent' },
-      { label: '75日', values: d.kairi75.values, dates: d.kairi75.dates, color: 'neutral' },
     ]);
   }
 });
