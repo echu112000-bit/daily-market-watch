@@ -40,6 +40,7 @@
   取得に失敗した場合はブラウザの「検証」機能で構造を再確認すること。
 """
 
+import json
 import os
 import re
 import requests
@@ -145,6 +146,7 @@ class StockSnapshot:
     margin_sell: dict = None                                  # {"balance","change","date"}
     margin_buy: dict = None
     margin_history: list = field(default_factory=list)        # [{"date","sell_balance","sell_change","buy_balance","buy_change","ratio"}]
+    charts: dict = field(default_factory=dict)                 # {"price":{"dates":[...],"values":[...]}, "rsi":..., "macd":..., "macd_signal":..., "kairi25":..., "kairi75":...}
 
 
 def _parse_price_cell(text: str):
@@ -438,6 +440,58 @@ def fetch_market_cap(code: str):
     return None
 
 
+CHART_HISTORY_POINTS = 90  # チャートに表示する直近の営業日数
+
+
+def _series_from_pairs(pairs, limit=CHART_HISTORY_POINTS):
+    """ [[epoch_ms, value], ...] -> {"dates":[...], "values":[...]} (直近limit件、日付昇順) """
+    pairs = pairs[-limit:] if pairs else []
+    dates = [datetime.fromtimestamp(ts / 1000, tz=JST).strftime("%Y-%m-%d") for ts, _ in pairs]
+    values = [v for _, v in pairs]
+    return {"dates": dates, "values": values}
+
+
+def fetch_chart_series(code: str, name: str) -> dict:
+    """
+    nikkeiyosoku.com が内部で使っているチャート用JSON APIから、
+    株価・RSI・MACD・移動平均乖離率(25日/75日)の時系列データを取得する。
+    (サイトのJS: stock_technical_chart / stock_kairi_chart / stock_macd_chart への
+     $.ajax POST呼び出しを直接再現している)
+    """
+    empty = {"price": {"dates": [], "values": []}, "rsi": {"dates": [], "values": []},
+              "macd": {"dates": [], "values": []}, "macd_signal": {"dates": [], "values": []},
+              "kairi25": {"dates": [], "values": []}, "kairi75": {"dates": [], "values": []}}
+    try:
+        rsi_json = requests.post(
+            "https://nikkeiyosoku.com/data/?stock_technical_chart",
+            headers=HEADERS, data={"type": "rsi", "code": code, "label": name}, timeout=15,
+        ).json()
+        kairi_json = requests.post(
+            "https://nikkeiyosoku.com/data/?stock_kairi_chart",
+            headers=HEADERS, data={"code": code}, timeout=15,
+        ).json()
+        macd_json = requests.post(
+            "https://nikkeiyosoku.com/data/?stock_macd_chart",
+            headers=HEADERS, data={"code": code, "label": name}, timeout=15,
+        ).json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"[WARN] {code}: チャート用データの取得に失敗しました({exc})。")
+        return empty
+
+    macd_close_key = next(
+        (k for k in macd_json if k not in ("MACD", "シグナル", "ゴールデンクロス", "デッドクロス")), None
+    )
+
+    return {
+        "price": _series_from_pairs(rsi_json.get("close", [])),
+        "rsi": _series_from_pairs(rsi_json.get("val", [])),
+        "macd": _series_from_pairs(macd_json.get("MACD", [])),
+        "macd_signal": _series_from_pairs(macd_json.get("シグナル", [])),
+        "kairi25": _series_from_pairs(kairi_json.get("val", [])),
+        "kairi75": _series_from_pairs(kairi_json.get("kari75", [])),
+    }
+
+
 def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
     snap = StockSnapshot(code=ticker["code"], name=ticker["name"])
     snap.date = short_data.get("date")
@@ -467,6 +521,8 @@ def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
         snap.shares_outstanding = round(market_cap / snap.price)
     if snap.short_positions_total and snap.shares_outstanding:
         snap.short_ratio = snap.short_positions_total / snap.shares_outstanding * 100
+
+    snap.charts = fetch_chart_series(ticker["code"], ticker["name"])
 
     return snap
 
@@ -578,6 +634,10 @@ REPORT_CSS = """
     border-radius: 0 6px 6px 0; font-size: 13.5px; margin-top: 18px;
   }
   footer { max-width: 880px; margin: 20px auto 0; font-size: 11.5px; color: var(--ink-soft); text-align: center; }
+  .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 10px; }
+  .chart-box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 6px; background: var(--panel); }
+  .chart-box-title { font-size: 12px; color: var(--ink-soft); margin-bottom: 4px; font-weight: 600; }
+  .chart-box canvas { max-height: 160px; }
 """
 
 
@@ -601,6 +661,19 @@ def _render_stock_section(s: StockSnapshot) -> str:
 
     ma_note = " / ".join(f"{period} {val}" for period, val in s.ma_deviation.items() if val)
     ma_note_html = f'<p class="note">移動平均乖離: {ma_note}</p>' if ma_note else ""
+
+    # --- チャート(株価・RSI・MACD・移動平均乖離率) ---
+    if s.charts.get("price", {}).get("values"):
+        charts_html = f"""
+        <div class="chart-grid">
+          <div class="chart-box"><div class="chart-box-title">株価</div><canvas id="chart-price-{s.code}"></canvas></div>
+          <div class="chart-box"><div class="chart-box-title">RSI(14)</div><canvas id="chart-rsi-{s.code}"></canvas></div>
+          <div class="chart-box"><div class="chart-box-title">MACD(12,26)</div><canvas id="chart-macd-{s.code}"></canvas></div>
+          <div class="chart-box"><div class="chart-box-title">移動平均乖離率(25日/75日)</div><canvas id="chart-kairi-{s.code}"></canvas></div>
+        </div>
+        """
+    else:
+        charts_html = '<p class="note">チャート用データを取得できませんでした。</p>'
 
     # --- 大口空売り残高 ---
     if s.short_positions:
@@ -748,6 +821,7 @@ def _render_stock_section(s: StockSnapshot) -> str:
       <h3 class="sub">テクニカル</h3>
       <div class="chip-row">{chip_html}</div>
       {ma_note_html}
+      {charts_html}
 
       {short_table}
       {change_table}
@@ -757,12 +831,91 @@ def _render_stock_section(s: StockSnapshot) -> str:
     """
 
 
+CHART_SCRIPT = """
+function renderLineChart(canvasId, datasets, opts) {
+  const ctx = document.getElementById(canvasId);
+  if (!ctx || !window.Chart) return;
+  const style = getComputedStyle(document.documentElement);
+  const ink = style.getPropertyValue('--ink-soft').trim();
+  const line = style.getPropertyValue('--line').trim();
+  const colors = {
+    accent: style.getPropertyValue('--accent').trim(),
+    buy: style.getPropertyValue('--buy').trim(),
+    sell: style.getPropertyValue('--sell').trim(),
+    neutral: style.getPropertyValue('--neutral').trim(),
+    ink: ink,
+  };
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: datasets[0] ? datasets[0].dates : [],
+      datasets: datasets.map(d => ({
+        label: d.label,
+        data: d.values,
+        borderColor: colors[d.color] || colors.accent,
+        backgroundColor: 'transparent',
+        borderWidth: d.dash ? 1 : 1.5,
+        borderDash: d.dash ? [4, 4] : [],
+        pointRadius: 0,
+        tension: 0.15,
+      })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: datasets.length > 1, labels: { color: ink, boxWidth: 12, font: { size: 10 } } } },
+      scales: {
+        x: { ticks: { color: ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: line } },
+        y: {
+          ticks: { color: ink, font: { size: 10 } },
+          grid: { color: line },
+          min: opts && opts.min !== undefined ? opts.min : undefined,
+          max: opts && opts.max !== undefined ? opts.max : undefined,
+        },
+      },
+    },
+  });
+}
+
+document.querySelectorAll('canvas[id^="chart-price-"]').forEach(canvas => {
+  const code = canvas.id.replace('chart-price-', '');
+  const d = CHART_DATA[code];
+  if (!d) return;
+  if (d.price.values.length) {
+    renderLineChart('chart-price-' + code, [{ label: '株価', values: d.price.values, dates: d.price.dates, color: 'accent' }]);
+  }
+  if (d.rsi.values.length) {
+    const refDates = d.rsi.dates;
+    renderLineChart('chart-rsi-' + code, [
+      { label: 'RSI', values: d.rsi.values, dates: refDates, color: 'accent' },
+      { label: '70', values: refDates.map(() => 70), dates: refDates, color: 'sell', dash: true },
+      { label: '30', values: refDates.map(() => 30), dates: refDates, color: 'buy', dash: true },
+    ], { min: 0, max: 100 });
+  }
+  if (d.macd.values.length) {
+    renderLineChart('chart-macd-' + code, [
+      { label: 'MACD', values: d.macd.values, dates: d.macd.dates, color: 'accent' },
+      { label: 'シグナル', values: d.macd_signal.values, dates: d.macd_signal.dates, color: 'neutral' },
+    ]);
+  }
+  if (d.kairi25.values.length) {
+    renderLineChart('chart-kairi-' + code, [
+      { label: '25日', values: d.kairi25.values, dates: d.kairi25.dates, color: 'accent' },
+      { label: '75日', values: d.kairi75.values, dates: d.kairi75.dates, color: 'neutral' },
+    ]);
+  }
+});
+"""
+
+
 def render_html_report(snapshots: list) -> str:
     """
     需給ウォッチのHTMLレポートを組み立てる。
     """
     today = _now_jst().strftime("%Y年%m月%d日")
     sections = "".join(_render_stock_section(s) for s in snapshots)
+    chart_data_json = json.dumps({s.code: s.charts for s in snapshots}, ensure_ascii=False)
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -783,6 +936,11 @@ def render_html_report(snapshots: list) -> str:
     データ出典:株ビジョン(stockscope.app)、投資の森(nikkeiyosoku.com)の公開情報をもとに自動生成した参考資料です。投資判断はご自身でお願いします。
   </footer>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+const CHART_DATA = {chart_data_json};
+{CHART_SCRIPT}
+</script>
 </body>
 </html>"""
 
