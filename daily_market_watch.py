@@ -207,20 +207,26 @@ def _parse_signed_int(text: str):
         return None
 
 
+FIRM_LOOKBACK_ROWS = 20   # 機関別残高・個人信用残高の「最新判明分」を探す範囲(従来通り)
+CHART_LOOKBACK_ROWS = 100  # 価格・出来高チャート用に取得する行数(stockscope側のpageSize)
+
+
 def fetch_short_selling(code: str, page) -> dict:
     """
     stockscope.app の大口空売り残高ページを、レンダリング済みDOMから取得する。
     機関ごとの残高・個人信用残高は毎日更新されるわけではないため、
-    直近の掲載範囲(最大20営業日)の中で最新の実データを機関ごとに探す。
-    あわせて、空売り全体の日次増減・個人信用残高の推移も時系列で拾う。
+    直近20営業日の中で最新の実データを機関ごとに探す(古すぎる実効性のない
+    データを拾わないため、チャート用の取得件数より狭い範囲にしている)。
+    あわせて、空売り全体の日次増減・個人信用残高の推移、
+    チャート用の価格・出来高の時系列(最大100営業日)も取得する。
     """
     empty = {
         "date": None, "price": None, "change_pct": None, "volume": None,
         "short_positions": [], "margin_sell": None, "margin_buy": None,
-        "daily_change_history": [], "margin_history": [],
+        "daily_change_history": [], "margin_history": [], "price_volume_history": [],
     }
 
-    url = f"https://stockscope.app/outstanding-short-selling-balances/{code}"
+    url = f"https://stockscope.app/outstanding-short-selling-balances/{code}?pageSize={CHART_LOOKBACK_ROWS}"
 
     # サイト側の接続が瞬断されることがあるため、軽くリトライする
     for attempt in range(3):
@@ -238,15 +244,16 @@ def fetch_short_selling(code: str, page) -> dict:
     except PlaywrightTimeoutError:
         print(f"[WARN] {code}: テーブルの読み込みがタイムアウトしました(サイト構造の変更/要ログインの可能性)。")
         return empty
-    page.wait_for_timeout(500)  # antdの行描画が落ち着くのを待つ
+    page.wait_for_timeout(800)  # antdの行描画(最大100行)が落ち着くのを待つ
 
     raw = page.evaluate(EXTRACT_TABLE_JS)
     if not raw or not raw["rows"]:
         print(f"[WARN] {code}: データ行が見つかりませんでした。")
         return empty
 
-    rows = raw["rows"]           # 新しい日付が先頭
+    rows = raw["rows"]           # 新しい日付が先頭、最大 CHART_LOOKBACK_ROWS 件
     firm_names = raw["firmNames"]
+    recent_rows = rows[:FIRM_LOOKBACK_ROWS]  # 機関別残高などは従来通り直近20日のみ対象
 
     latest = rows[0]
     price, change_pct = _parse_price_cell(latest["price"])
@@ -254,7 +261,7 @@ def fetch_short_selling(code: str, page) -> dict:
 
     short_positions = []
     for i, firm in enumerate(firm_names):
-        for row in rows:
+        for row in recent_rows:
             balance, change = _parse_balance_cell(row["firms"][i])
             if balance is not None:
                 short_positions.append({
@@ -265,7 +272,7 @@ def fetch_short_selling(code: str, page) -> dict:
     margin_sell = None
     margin_buy = None
     margin_history = []
-    for row in rows:
+    for row in recent_rows:
         sell_balance, sell_change = _parse_balance_cell(row["sell"])
         buy_balance, buy_change = _parse_balance_cell(row["buy"])
         if margin_sell is None and sell_balance is not None:
@@ -280,10 +287,10 @@ def fetch_short_selling(code: str, page) -> dict:
                 "buy_balance": buy_balance, "buy_change": buy_change,
                 "ratio": ratio,
             })
-    # rows は新しい日付が先頭のまま(降順)にしておく
+    # recent_rows は新しい日付が先頭のまま(降順)にしておく
 
     daily_change_history = []
-    for row in rows:
+    for row in recent_rows:
         zenzougen = _parse_signed_int(row["zenzougen"])
         if not zenzougen:  # None または 0(変化なし)は除外
             continue
@@ -291,7 +298,16 @@ def fetch_short_selling(code: str, page) -> dict:
         daily_change_history.append({
             "date": row["date"], "price": row_price, "change_pct": row_change_pct, "zenzougen": zenzougen,
         })
-    # rows は新しい日付が先頭のまま(降順)にしておく
+    # recent_rows は新しい日付が先頭のまま(降順)にしておく
+
+    # チャート(価格・出来高・価格帯別出来高)用に、取得した全行(最大100日分)の価格と出来高を拾っておく
+    price_volume_history = []
+    for row in rows:
+        row_price, _ = _parse_price_cell(row["price"])
+        row_volume = _parse_int_cell(row["volume"])
+        date_match = re.match(r"\d{4}-\d{2}-\d{2}", row["date"])
+        if row_price is not None and row_volume is not None and date_match:
+            price_volume_history.append({"date": date_match.group(), "price": row_price, "volume": row_volume})
 
     return {
         "date": latest["date"],
@@ -303,6 +319,7 @@ def fetch_short_selling(code: str, page) -> dict:
         "margin_buy": margin_buy,
         "margin_history": margin_history,
         "daily_change_history": daily_change_history,
+        "price_volume_history": price_volume_history,
     }
 
 
@@ -441,6 +458,7 @@ def fetch_market_cap(code: str):
 
 
 CHART_HISTORY_POINTS = 90  # チャートに表示する直近の営業日数
+MA_WINDOWS = (5, 25, 75)   # 株価チャートに重ねる移動平均線(日数)
 
 
 def _series_from_pairs(pairs, limit=CHART_HISTORY_POINTS):
@@ -451,16 +469,31 @@ def _series_from_pairs(pairs, limit=CHART_HISTORY_POINTS):
     return {"dates": dates, "values": values}
 
 
+def _simple_moving_average(values: list, window: int) -> list:
+    """ 先頭window-1件はNone(計算に必要な過去データが足りない)。 """
+    result = []
+    for i in range(len(values)):
+        if i + 1 < window:
+            result.append(None)
+        else:
+            chunk = values[i + 1 - window:i + 1]
+            result.append(round(sum(chunk) / window, 2))
+    return result
+
+
 def fetch_chart_series(code: str, name: str) -> dict:
     """
     nikkeiyosoku.com が内部で使っているチャート用JSON APIから、
     株価・RSI・MACD・移動平均乖離率(25日/75日)の時系列データを取得する。
     (サイトのJS: stock_technical_chart / stock_kairi_chart / stock_macd_chart への
      $.ajax POST呼び出しを直接再現している)
+    移動平均線(5/25/75日)は表示期間より手前のデータも使って計算してから
+    表示期間分だけ切り出すことで、表示開始直後から欠けなく描画できるようにしている。
     """
     empty = {"price": {"dates": [], "values": []}, "rsi": {"dates": [], "values": []},
               "macd": {"dates": [], "values": []}, "macd_signal": {"dates": [], "values": []},
-              "kairi25": {"dates": [], "values": []}, "kairi75": {"dates": [], "values": []}}
+              "kairi25": {"dates": [], "values": []}, "kairi75": {"dates": [], "values": []},
+              "sma": {str(w): {"dates": [], "values": []} for w in MA_WINDOWS}}
     try:
         rsi_json = requests.post(
             "https://nikkeiyosoku.com/data/?stock_technical_chart",
@@ -478,17 +511,23 @@ def fetch_chart_series(code: str, name: str) -> dict:
         print(f"[WARN] {code}: チャート用データの取得に失敗しました({exc})。")
         return empty
 
-    macd_close_key = next(
-        (k for k in macd_json if k not in ("MACD", "シグナル", "ゴールデンクロス", "デッドクロス")), None
-    )
+    price_pairs_full = rsi_json.get("close", [])
+    price_values_full = [v for _, v in price_pairs_full]
+    price_series = _series_from_pairs(price_pairs_full)
+
+    sma = {}
+    for window in MA_WINDOWS:
+        sma_full = _simple_moving_average(price_values_full, window)
+        sma[str(window)] = {"dates": price_series["dates"], "values": sma_full[-CHART_HISTORY_POINTS:]}
 
     return {
-        "price": _series_from_pairs(rsi_json.get("close", [])),
+        "price": price_series,
         "rsi": _series_from_pairs(rsi_json.get("val", [])),
         "macd": _series_from_pairs(macd_json.get("MACD", [])),
         "macd_signal": _series_from_pairs(macd_json.get("シグナル", [])),
         "kairi25": _series_from_pairs(kairi_json.get("val", [])),
         "kairi75": _series_from_pairs(kairi_json.get("kari75", [])),
+        "sma": sma,
     }
 
 
@@ -524,7 +563,40 @@ def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
 
     snap.charts = fetch_chart_series(ticker["code"], ticker["name"])
 
+    price_volume_history = short_data.get("price_volume_history", [])
+    volume_by_date = {h["date"]: h["volume"] for h in price_volume_history}
+    chart_dates = snap.charts.get("price", {}).get("dates", [])
+    snap.charts["volume"] = {
+        "dates": chart_dates,
+        "values": [volume_by_date.get(d) for d in chart_dates],
+    }
+    snap.charts["volume_profile"] = _volume_profile(price_volume_history)
+
     return snap
+
+
+def _volume_profile(price_volume_history: list, bins: int = 12) -> dict:
+    """
+    終値×日次出来高をもとに、価格帯ごとの出来高合計を概算する(価格帯別出来高)。
+    本来は分足・ティックデータを使う指標のため、ここでは簡易的な近似値であることに注意。
+    """
+    valid = [(h["price"], h["volume"]) for h in price_volume_history if h["price"] and h["volume"]]
+    if not valid:
+        return {"labels": [], "values": []}
+
+    prices = [p for p, _ in valid]
+    lo, hi = min(prices), max(prices)
+    if lo == hi:
+        return {"labels": [f"{lo:,.0f}"], "values": [sum(v for _, v in valid)]}
+
+    bin_width = (hi - lo) / bins
+    buckets = [0] * bins
+    for p, v in valid:
+        idx = min(int((p - lo) / bin_width), bins - 1)
+        buckets[idx] += v
+
+    labels = [f"{lo + i * bin_width:,.0f}" for i in range(bins)]
+    return {"labels": labels, "values": buckets}
 
 
 def _fmt_balance(item):
@@ -557,6 +629,8 @@ REPORT_CSS = """
     --sell-bg: #fbeae9;
     --neutral: #8a6d1f;
     --neutral-bg: #f6f0dd;
+    --chart-2: #4d6fb5;
+    --chart-3: #b56f2b;
     --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   }
   @media (prefers-color-scheme: dark) {
@@ -564,12 +638,14 @@ REPORT_CSS = """
       --bg: #15181a; --panel: #1d2124; --ink: #ece9e3; --ink-soft: #a3a099;
       --line: #33383b; --accent: #6fb8ae; --buy: #4fd18b; --buy-bg: #16332480;
       --sell: #ff8a80; --sell-bg: #3a191680; --neutral: #e0c66b; --neutral-bg: #332d1480;
+      --chart-2: #8ca8e8; --chart-3: #e0a361;
     }
   }
   :root[data-theme="dark"] {
     --bg: #15181a; --panel: #1d2124; --ink: #ece9e3; --ink-soft: #a3a099;
     --line: #33383b; --accent: #6fb8ae; --buy: #4fd18b; --buy-bg: #16332480;
     --sell: #ff8a80; --sell-bg: #3a191680; --neutral: #e0c66b; --neutral-bg: #332d1480;
+    --chart-2: #8ca8e8; --chart-3: #e0a361;
   }
   * { box-sizing: border-box; }
   body {
@@ -634,10 +710,17 @@ REPORT_CSS = """
     border-radius: 0 6px 6px 0; font-size: 13.5px; margin-top: 18px;
   }
   footer { max-width: 880px; margin: 20px auto 0; font-size: 11.5px; color: var(--ink-soft); text-align: center; }
-  .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 10px; }
+  .chart-stack { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+  .chart-row { display: flex; gap: 10px; align-items: stretch; }
+  .chart-row .chart-box:first-child { flex: 3 1 0; min-width: 0; }
+  .chart-row .chart-box:last-child { flex: 1 1 0; min-width: 120px; }
   .chart-box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 6px; background: var(--panel); }
   .chart-box-title { font-size: 12px; color: var(--ink-soft); margin-bottom: 4px; font-weight: 600; }
-  .chart-box canvas { max-height: 160px; }
+  .chart-box canvas { max-height: 150px; }
+  .chart-box.chart-tall canvas { max-height: 190px; }
+  @media (max-width: 560px) {
+    .chart-row { flex-direction: column; }
+  }
 """
 
 
@@ -662,15 +745,20 @@ def _render_stock_section(s: StockSnapshot) -> str:
     ma_note = " / ".join(f"{period} {val}" for period, val in s.ma_deviation.items() if val)
     ma_note_html = f'<p class="note">移動平均乖離: {ma_note}</p>' if ma_note else ""
 
-    # --- チャート(株価・RSI・MACD・移動平均乖離率) ---
+    # --- チャート(株価+出来高+価格帯別出来高+RSI+MACD+移動平均乖離率、時系列軸を揃えて縦に並べる) ---
     if s.charts.get("price", {}).get("values"):
         charts_html = f"""
-        <div class="chart-grid">
-          <div class="chart-box"><div class="chart-box-title">株価</div><canvas id="chart-price-{s.code}"></canvas></div>
+        <div class="chart-stack">
+          <div class="chart-row">
+            <div class="chart-box chart-tall"><div class="chart-box-title">株価(5日/25日/75日移動平均線つき)</div><canvas id="chart-price-{s.code}"></canvas></div>
+            <div class="chart-box chart-tall"><div class="chart-box-title">価格帯別出来高(概算)</div><canvas id="chart-volprofile-{s.code}"></canvas></div>
+          </div>
+          <div class="chart-box"><div class="chart-box-title">出来高</div><canvas id="chart-volume-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">RSI(14)</div><canvas id="chart-rsi-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">MACD(12,26)</div><canvas id="chart-macd-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">移動平均乖離率(25日/75日)</div><canvas id="chart-kairi-{s.code}"></canvas></div>
         </div>
+        <p class="note">価格帯別出来高は終値×日次出来高をもとにした概算値です(分足データがないため簡易近似)。</p>
         """
     else:
         charts_html = '<p class="note">チャート用データを取得できませんでした。</p>'
@@ -832,19 +920,20 @@ def _render_stock_section(s: StockSnapshot) -> str:
 
 
 CHART_SCRIPT = """
+function chartColors() {
+  const style = getComputedStyle(document.documentElement);
+  const g = (name) => style.getPropertyValue(name).trim();
+  return {
+    ink: g('--ink-soft'), line: g('--line'),
+    accent: g('--accent'), buy: g('--buy'), sell: g('--sell'),
+    neutral: g('--neutral'), chart2: g('--chart-2'), chart3: g('--chart-3'),
+  };
+}
+
 function renderLineChart(canvasId, datasets, opts) {
   const ctx = document.getElementById(canvasId);
   if (!ctx || !window.Chart) return;
-  const style = getComputedStyle(document.documentElement);
-  const ink = style.getPropertyValue('--ink-soft').trim();
-  const line = style.getPropertyValue('--line').trim();
-  const colors = {
-    accent: style.getPropertyValue('--accent').trim(),
-    buy: style.getPropertyValue('--buy').trim(),
-    sell: style.getPropertyValue('--sell').trim(),
-    neutral: style.getPropertyValue('--neutral').trim(),
-    ink: ink,
-  };
+  const colors = chartColors();
   new Chart(ctx, {
     type: 'line',
     data: {
@@ -857,6 +946,7 @@ function renderLineChart(canvasId, datasets, opts) {
         borderWidth: d.dash ? 1 : 1.5,
         borderDash: d.dash ? [4, 4] : [],
         pointRadius: 0,
+        spanGaps: true,
         tension: 0.15,
       })),
     },
@@ -864,15 +954,52 @@ function renderLineChart(canvasId, datasets, opts) {
       responsive: true,
       maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
-      plugins: { legend: { display: datasets.length > 1, labels: { color: ink, boxWidth: 12, font: { size: 10 } } } },
+      plugins: { legend: { display: datasets.length > 1, labels: { color: colors.ink, boxWidth: 12, font: { size: 10 } } } },
       scales: {
-        x: { ticks: { color: ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: line } },
+        x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: colors.line } },
         y: {
-          ticks: { color: ink, font: { size: 10 } },
-          grid: { color: line },
+          ticks: { color: colors.ink, font: { size: 10 } },
+          grid: { color: colors.line },
           min: opts && opts.min !== undefined ? opts.min : undefined,
           max: opts && opts.max !== undefined ? opts.max : undefined,
         },
+      },
+    },
+  });
+}
+
+function renderVolumeChart(canvasId, dates, values) {
+  const ctx = document.getElementById(canvasId);
+  if (!ctx || !window.Chart) return;
+  const colors = chartColors();
+  new Chart(ctx, {
+    type: 'bar',
+    data: { labels: dates, datasets: [{ label: '出来高', data: values, backgroundColor: colors.accent + '80', borderWidth: 0 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { display: false } },
+        y: { ticks: { color: colors.ink, font: { size: 10 } }, grid: { color: colors.line } },
+      },
+    },
+  });
+}
+
+function renderVolumeProfile(canvasId, labels, values) {
+  const ctx = document.getElementById(canvasId);
+  if (!ctx || !window.Chart) return;
+  const colors = chartColors();
+  new Chart(ctx, {
+    type: 'bar',
+    data: { labels: labels, datasets: [{ label: '出来高(概算)', data: values, backgroundColor: colors.chart2 + '80', borderWidth: 0 }] },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: colors.ink, font: { size: 9 }, maxTicksLimit: 4 }, grid: { color: colors.line } },
+        y: { ticks: { color: colors.ink, font: { size: 9 } }, grid: { display: false } },
       },
     },
   });
@@ -883,7 +1010,18 @@ document.querySelectorAll('canvas[id^="chart-price-"]').forEach(canvas => {
   const d = CHART_DATA[code];
   if (!d) return;
   if (d.price.values.length) {
-    renderLineChart('chart-price-' + code, [{ label: '株価', values: d.price.values, dates: d.price.dates, color: 'accent' }]);
+    renderLineChart('chart-price-' + code, [
+      { label: '株価', values: d.price.values, dates: d.price.dates, color: 'accent' },
+      { label: '5日線', values: d.sma['5'].values, dates: d.price.dates, color: 'buy' },
+      { label: '25日線', values: d.sma['25'].values, dates: d.price.dates, color: 'chart2' },
+      { label: '75日線', values: d.sma['75'].values, dates: d.price.dates, color: 'chart3' },
+    ]);
+  }
+  if (d.volume_profile.values.length) {
+    renderVolumeProfile('chart-volprofile-' + code, d.volume_profile.labels, d.volume_profile.values);
+  }
+  if (d.volume.values.length) {
+    renderVolumeChart('chart-volume-' + code, d.volume.dates, d.volume.values);
   }
   if (d.rsi.values.length) {
     const refDates = d.rsi.dates;
