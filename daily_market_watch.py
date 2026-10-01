@@ -458,7 +458,7 @@ def fetch_market_cap(code: str):
 
 
 CHART_HISTORY_POINTS = 90  # チャートに表示する直近の営業日数
-MA_WINDOWS = (5, 25, 75)   # 株価チャートに重ねる移動平均線(日数)
+MA_WINDOWS = (25, 75)   # 株価チャートに重ねる移動平均線(日数)。短期線は株価と色が被り見づらいため外している
 
 
 def _series_from_pairs(pairs, limit=CHART_HISTORY_POINTS):
@@ -750,9 +750,8 @@ def _render_stock_section(s: StockSnapshot) -> str:
     if s.charts.get("price", {}).get("values"):
         charts_html = f"""
         <div class="chart-stack">
-          <div class="chart-box chart-tall"><div class="chart-box-title">株価(5日/25日/75日移動平均線、右側に価格帯別出来高の概算)</div><canvas id="chart-price-{s.code}"></canvas></div>
-          <div class="chart-box"><div class="chart-box-title">出来高</div><canvas id="chart-volume-{s.code}"></canvas></div>
-          <div class="chart-box"><div class="chart-box-title">RSI(14)</div><canvas id="chart-rsi-{s.code}"></canvas></div>
+          <div class="chart-box chart-tall"><div class="chart-box-title">株価(25日/75日移動平均線、右側に価格帯別出来高の概算)</div><canvas id="chart-price-{s.code}"></canvas></div>
+          <div class="chart-box"><div class="chart-box-title">出来高 + RSI(14)</div><canvas id="chart-volrsi-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">MACD(12,26)</div><canvas id="chart-macd-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">移動平均乖離率(25日/75日)</div><canvas id="chart-kairi-{s.code}"></canvas></div>
         </div>
@@ -995,19 +994,28 @@ function renderLineChart(canvasId, datasets, opts) {
   });
 }
 
-function renderVolumeChart(canvasId, dates, values) {
+function renderVolumeRsiChart(canvasId, dates, volumeValues, rsiValues) {
   const ctx = document.getElementById(canvasId);
   if (!ctx || !window.Chart) return;
   const colors = chartColors();
   new Chart(ctx, {
-    type: 'bar',
-    data: { labels: dates, datasets: [{ label: '出来高', data: values, backgroundColor: colors.accent + '80', borderWidth: 0 }] },
+    data: {
+      labels: dates,
+      datasets: [
+        { type: 'bar', label: '出来高', data: volumeValues, backgroundColor: colors.accent + '45', borderWidth: 0, yAxisID: 'yVol', order: 3 },
+        { type: 'line', label: 'RSI', data: rsiValues, borderColor: colors.chart2, backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, spanGaps: true, tension: 0.15, yAxisID: 'yRsi', order: 1 },
+        { type: 'line', label: '70', data: dates.map(() => 70), borderColor: colors.sell, backgroundColor: 'transparent', borderWidth: 1, borderDash: [4, 4], pointRadius: 0, yAxisID: 'yRsi', order: 2 },
+        { type: 'line', label: '30', data: dates.map(() => 30), borderColor: colors.buy, backgroundColor: 'transparent', borderWidth: 1, borderDash: [4, 4], pointRadius: 0, yAxisID: 'yRsi', order: 2 },
+      ],
+    },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: true, labels: { color: colors.ink, boxWidth: 12, font: { size: 10 } } } },
       scales: {
-        x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { display: false } },
-        y: { ticks: { color: colors.ink, font: { size: 10 } }, grid: { color: colors.line } },
+        x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: colors.line } },
+        yVol: { position: 'left', ticks: { color: colors.ink, font: { size: 9 } }, grid: { display: false } },
+        yRsi: { position: 'right', min: 0, max: 100, ticks: { color: colors.ink, font: { size: 9 } }, grid: { color: colors.line } },
       },
     },
   });
@@ -1021,23 +1029,14 @@ document.querySelectorAll('canvas[id^="chart-price-"]').forEach(canvas => {
   if (d.price.values.length) {
     renderLineChart('chart-price-' + code, [
       { label: '株価', values: d.price.values, dates: d.price.dates, color: 'accent', width: 2.25 },
-      { label: '5日線', values: d.sma['5'].values, dates: d.price.dates, color: 'buy', width: 1 },
       { label: '25日線', values: d.sma['25'].values, dates: d.price.dates, color: 'chart2', width: 1, dashPattern: [6, 3] },
       { label: '75日線', values: d.sma['75'].values, dates: d.price.dates, color: 'chart3', width: 1, dashPattern: [2, 2] },
     ], {
       volumeProfile: { bins: d.volume_profile.bins, color: colors.chart2 + '45', widthRatio: 0.22 },
     });
   }
-  if (d.volume.values.length) {
-    renderVolumeChart('chart-volume-' + code, d.volume.dates, d.volume.values);
-  }
-  if (d.rsi.values.length) {
-    const refDates = d.rsi.dates;
-    renderLineChart('chart-rsi-' + code, [
-      { label: 'RSI', values: d.rsi.values, dates: refDates, color: 'accent' },
-      { label: '70', values: refDates.map(() => 70), dates: refDates, color: 'sell', dash: true },
-      { label: '30', values: refDates.map(() => 30), dates: refDates, color: 'buy', dash: true },
-    ], { min: 0, max: 100 });
+  if (d.volume.values.length || d.rsi.values.length) {
+    renderVolumeRsiChart('chart-volrsi-' + code, d.price.dates, d.volume.values, d.rsi.values);
   }
   if (d.macd.values.length) {
     renderLineChart('chart-macd-' + code, [
