@@ -910,8 +910,16 @@ def _render_stock_section(s: StockSnapshot) -> str:
 
 
 CHART_SCRIPT = """
-const Y_AXIS_WIDTH = 54; // 全チャートの左軸幅をそろえ、数字の桁数が違っても日付軸(縦方向)が一致するようにする
-const Y_AXIS_WIDTH_RIGHT = 38;
+// 全チャートの左軸(Y軸)の幅をそろえるため、数字を等幅フォント+固定桁数でパディングする。
+// (Chart.jsのscale.afterFitでwidthを強制しても、後続のレイアウト計算で上書きされて
+//  効かないことがあるため、ラベル文字数を物理的にそろえる方式にしている)
+const TICK_LABEL_WIDTH = 9;
+const MONO_FONT = '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace';
+function padTick(value) {
+  if (value === null || value === undefined) return '';
+  const text = typeof value === 'number' ? value.toLocaleString() : String(value);
+  return text.padStart(TICK_LABEL_WIDTH, ' ');
+}
 
 function chartColors() {
   const style = getComputedStyle(document.documentElement);
@@ -961,11 +969,10 @@ function renderLineChart(canvasId, datasets, opts) {
     scales: {
       x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: colors.line } },
       y: {
-        ticks: { color: colors.ink, font: { size: 10 } },
+        ticks: { color: colors.ink, font: { size: 10, family: MONO_FONT }, callback: padTick },
         grid: { color: colors.line },
         min: opts && opts.min !== undefined ? opts.min : undefined,
         max: opts && opts.max !== undefined ? opts.max : undefined,
-        afterFit: (scale) => { scale.width = Y_AXIS_WIDTH; },
       },
     },
   };
@@ -1012,8 +1019,8 @@ function renderVolumeRsiChart(canvasId, dates, volumeValues, rsiValues) {
       plugins: { legend: { display: true, labels: { color: colors.ink, boxWidth: 12, font: { size: 10 } } } },
       scales: {
         x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: colors.line } },
-        yVol: { position: 'left', ticks: { color: colors.ink, font: { size: 9 } }, grid: { display: false }, afterFit: (scale) => { scale.width = Y_AXIS_WIDTH; } },
-        yRsi: { position: 'right', min: 0, max: 100, ticks: { color: colors.ink, font: { size: 9 } }, grid: { color: colors.line }, afterFit: (scale) => { scale.width = Y_AXIS_WIDTH_RIGHT; } },
+        yVol: { position: 'left', ticks: { color: colors.ink, font: { size: 10, family: MONO_FONT }, callback: padTick }, grid: { display: false } },
+        yRsi: { position: 'right', min: 0, max: 100, ticks: { color: colors.ink, font: { size: 10 } }, grid: { color: colors.line } },
       },
     },
   });
