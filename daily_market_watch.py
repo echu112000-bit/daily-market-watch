@@ -575,19 +575,21 @@ def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
     return snap
 
 
-def _volume_profile(price_volume_history: list, bins: int = 12) -> dict:
+def _volume_profile(price_volume_history: list, bins: int = 16) -> dict:
     """
     終値×日次出来高をもとに、価格帯ごとの出来高合計を概算する(価格帯別出来高)。
     本来は分足・ティックデータを使う指標のため、ここでは簡易的な近似値であることに注意。
+    株価チャートの右側に、同じ価格(Y)軸を使って重ね描きするため、
+    価格帯の上限/下限(low/high)を数値のまま返す。
     """
     valid = [(h["price"], h["volume"]) for h in price_volume_history if h["price"] and h["volume"]]
     if not valid:
-        return {"labels": [], "values": []}
+        return {"bins": []}
 
     prices = [p for p, _ in valid]
     lo, hi = min(prices), max(prices)
     if lo == hi:
-        return {"labels": [f"{lo:,.0f}"], "values": [sum(v for _, v in valid)]}
+        return {"bins": [{"low": lo, "high": lo, "volume": sum(v for _, v in valid)}]}
 
     bin_width = (hi - lo) / bins
     buckets = [0] * bins
@@ -595,8 +597,12 @@ def _volume_profile(price_volume_history: list, bins: int = 12) -> dict:
         idx = min(int((p - lo) / bin_width), bins - 1)
         buckets[idx] += v
 
-    labels = [f"{lo + i * bin_width:,.0f}" for i in range(bins)]
-    return {"labels": labels, "values": buckets}
+    return {
+        "bins": [
+            {"low": lo + i * bin_width, "high": lo + (i + 1) * bin_width, "volume": buckets[i]}
+            for i in range(bins)
+        ]
+    }
 
 
 def _fmt_balance(item):
@@ -711,16 +717,10 @@ REPORT_CSS = """
   }
   footer { max-width: 880px; margin: 20px auto 0; font-size: 11.5px; color: var(--ink-soft); text-align: center; }
   .chart-stack { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
-  .chart-row { display: flex; gap: 10px; align-items: stretch; }
-  .chart-row .chart-box:first-child { flex: 3 1 0; min-width: 0; }
-  .chart-row .chart-box:last-child { flex: 1 1 0; min-width: 120px; }
   .chart-box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 6px; background: var(--panel); }
   .chart-box-title { font-size: 12px; color: var(--ink-soft); margin-bottom: 4px; font-weight: 600; }
   .chart-box canvas { max-height: 150px; }
-  .chart-box.chart-tall canvas { max-height: 190px; }
-  @media (max-width: 560px) {
-    .chart-row { flex-direction: column; }
-  }
+  .chart-box.chart-tall canvas { max-height: 220px; }
 """
 
 
@@ -745,20 +745,17 @@ def _render_stock_section(s: StockSnapshot) -> str:
     ma_note = " / ".join(f"{period} {val}" for period, val in s.ma_deviation.items() if val)
     ma_note_html = f'<p class="note">移動平均乖離: {ma_note}</p>' if ma_note else ""
 
-    # --- チャート(株価+出来高+価格帯別出来高+RSI+MACD+移動平均乖離率、時系列軸を揃えて縦に並べる) ---
+    # --- チャート(株価+出来高+RSI+MACD+移動平均乖離率、時系列軸を揃えて縦に並べる) ---
+    # 価格帯別出来高は別パネルにせず、株価チャートの右側にY軸(価格)を共有する形で重ね描きする。
     if s.charts.get("price", {}).get("values"):
         charts_html = f"""
         <div class="chart-stack">
-          <div class="chart-row">
-            <div class="chart-box chart-tall"><div class="chart-box-title">株価(5日/25日/75日移動平均線つき)</div><canvas id="chart-price-{s.code}"></canvas></div>
-            <div class="chart-box chart-tall"><div class="chart-box-title">価格帯別出来高(概算)</div><canvas id="chart-volprofile-{s.code}"></canvas></div>
-          </div>
+          <div class="chart-box chart-tall"><div class="chart-box-title">株価(5日/25日/75日移動平均線、右側に価格帯別出来高の概算)</div><canvas id="chart-price-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">出来高</div><canvas id="chart-volume-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">RSI(14)</div><canvas id="chart-rsi-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">MACD(12,26)</div><canvas id="chart-macd-{s.code}"></canvas></div>
           <div class="chart-box"><div class="chart-box-title">移動平均乖離率(25日/75日)</div><canvas id="chart-kairi-{s.code}"></canvas></div>
         </div>
-        <p class="note">価格帯別出来高は終値×日次出来高をもとにした概算値です(分足データがないため簡易近似)。</p>
         """
     else:
         charts_html = '<p class="note">チャート用データを取得できませんでした。</p>'
@@ -930,10 +927,54 @@ function chartColors() {
   };
 }
 
+const volumeProfilePlugin = {
+  id: 'volumeProfile',
+  afterDatasetsDraw(chart, args, pluginOpts) {
+    const bins = pluginOpts && pluginOpts.bins;
+    if (!bins || !bins.length) return;
+    const { ctx, chartArea, scales } = chart;
+    const yScale = scales.y;
+    const maxVol = Math.max(...bins.map(b => b.volume));
+    if (!maxVol) return;
+    const widthRatio = pluginOpts.widthRatio !== undefined ? pluginOpts.widthRatio : 0.22;
+    const maxBarWidth = chartArea.width * widthRatio;
+    ctx.save();
+    ctx.fillStyle = pluginOpts.color || 'rgba(100,100,200,0.3)';
+    bins.forEach(bin => {
+      const yTop = yScale.getPixelForValue(bin.high);
+      const yBottom = yScale.getPixelForValue(bin.low);
+      const barWidth = (bin.volume / maxVol) * maxBarWidth;
+      const top = Math.min(yTop, yBottom);
+      const height = Math.max(Math.abs(yBottom - yTop) - 1, 1);
+      ctx.fillRect(chartArea.right - barWidth, top, barWidth, height);
+    });
+    ctx.restore();
+  },
+};
+if (window.Chart) { Chart.register(volumeProfilePlugin); }
+
 function renderLineChart(canvasId, datasets, opts) {
   const ctx = document.getElementById(canvasId);
   if (!ctx || !window.Chart) return;
   const colors = chartColors();
+  const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: { legend: { display: datasets.length > 1, labels: { color: colors.ink, boxWidth: 12, font: { size: 10 } } } },
+    scales: {
+      x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: colors.line } },
+      y: {
+        ticks: { color: colors.ink, font: { size: 10 } },
+        grid: { color: colors.line },
+        min: opts && opts.min !== undefined ? opts.min : undefined,
+        max: opts && opts.max !== undefined ? opts.max : undefined,
+      },
+    },
+  };
+  if (opts && opts.volumeProfile) {
+    chartOptions.plugins.volumeProfile = opts.volumeProfile;
+  }
   new Chart(ctx, {
     type: 'line',
     data: {
@@ -943,28 +984,14 @@ function renderLineChart(canvasId, datasets, opts) {
         data: d.values,
         borderColor: colors[d.color] || colors.accent,
         backgroundColor: 'transparent',
-        borderWidth: d.dash ? 1 : 1.5,
-        borderDash: d.dash ? [4, 4] : [],
+        borderWidth: d.width || 1.5,
+        borderDash: d.dashPattern || (d.dash ? [4, 4] : []),
         pointRadius: 0,
         spanGaps: true,
         tension: 0.15,
       })),
     },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: { legend: { display: datasets.length > 1, labels: { color: colors.ink, boxWidth: 12, font: { size: 10 } } } },
-      scales: {
-        x: { ticks: { color: colors.ink, maxTicksLimit: 6, font: { size: 10 } }, grid: { color: colors.line } },
-        y: {
-          ticks: { color: colors.ink, font: { size: 10 } },
-          grid: { color: colors.line },
-          min: opts && opts.min !== undefined ? opts.min : undefined,
-          max: opts && opts.max !== undefined ? opts.max : undefined,
-        },
-      },
-    },
+    options: chartOptions,
   });
 }
 
@@ -986,39 +1013,20 @@ function renderVolumeChart(canvasId, dates, values) {
   });
 }
 
-function renderVolumeProfile(canvasId, labels, values) {
-  const ctx = document.getElementById(canvasId);
-  if (!ctx || !window.Chart) return;
-  const colors = chartColors();
-  new Chart(ctx, {
-    type: 'bar',
-    data: { labels: labels, datasets: [{ label: '出来高(概算)', data: values, backgroundColor: colors.chart2 + '80', borderWidth: 0 }] },
-    options: {
-      indexAxis: 'y',
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: colors.ink, font: { size: 9 }, maxTicksLimit: 4 }, grid: { color: colors.line } },
-        y: { ticks: { color: colors.ink, font: { size: 9 } }, grid: { display: false } },
-      },
-    },
-  });
-}
-
 document.querySelectorAll('canvas[id^="chart-price-"]').forEach(canvas => {
   const code = canvas.id.replace('chart-price-', '');
   const d = CHART_DATA[code];
   if (!d) return;
+  const colors = chartColors();
   if (d.price.values.length) {
     renderLineChart('chart-price-' + code, [
-      { label: '株価', values: d.price.values, dates: d.price.dates, color: 'accent' },
-      { label: '5日線', values: d.sma['5'].values, dates: d.price.dates, color: 'buy' },
-      { label: '25日線', values: d.sma['25'].values, dates: d.price.dates, color: 'chart2' },
-      { label: '75日線', values: d.sma['75'].values, dates: d.price.dates, color: 'chart3' },
-    ]);
-  }
-  if (d.volume_profile.values.length) {
-    renderVolumeProfile('chart-volprofile-' + code, d.volume_profile.labels, d.volume_profile.values);
+      { label: '株価', values: d.price.values, dates: d.price.dates, color: 'accent', width: 2.25 },
+      { label: '5日線', values: d.sma['5'].values, dates: d.price.dates, color: 'buy', width: 1 },
+      { label: '25日線', values: d.sma['25'].values, dates: d.price.dates, color: 'chart2', width: 1, dashPattern: [6, 3] },
+      { label: '75日線', values: d.sma['75'].values, dates: d.price.dates, color: 'chart3', width: 1, dashPattern: [2, 2] },
+    ], {
+      volumeProfile: { bins: d.volume_profile.bins, color: colors.chart2 + '45', widthRatio: 0.22 },
+    });
   }
   if (d.volume.values.length) {
     renderVolumeChart('chart-volume-' + code, d.volume.dates, d.volume.values);
