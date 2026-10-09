@@ -73,6 +73,7 @@ except ImportError:
 TICKERS = [
     {"code": "4385", "name": "メルカリ"},
     {"code": "6777", "name": "santec Holdings"},
+    {"code": "8308", "name": "りそなホールディングス"},
 ]
 
 HEADERS = {
@@ -131,7 +132,7 @@ class StockSnapshot:
     name: str
     market: str = None
     date: str = ""
-    price: int = None
+    price: float = None                                       # 整数価格の銘柄は int のまま入る
     change_pct: float = None
     price_change: float = None
     volume: int = None
@@ -150,15 +151,19 @@ class StockSnapshot:
 
 
 def _parse_price_cell(text: str):
-    """ "3,621円\\n-6.36%" -> (3621, -6.36) """
+    """ "3,621円\\n-6.36%" -> (3621, -6.36) / "2,439.5円" のように小数がある銘柄は float で返す """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if not lines:
         return None, None
     price = None
+    price_text = lines[0].replace(",", "").replace("円", "")
     try:
-        price = int(lines[0].replace(",", "").replace("円", ""))
+        price = int(price_text)
     except ValueError:
-        price = None
+        try:
+            price = float(price_text)
+        except ValueError:
+            price = None
     change_pct = None
     if len(lines) > 1:
         try:
@@ -426,13 +431,16 @@ def fetch_technical_indicators(code: str) -> dict:
 
 
 def _parse_japanese_amount(text: str):
-    """ "5985億4500万" -> 598545000000 (円) """
+    """ "5985億4500万" -> 598545000000 / "5兆6282億6000万" -> 5628260000000 (円) """
     text = text.strip()
+    m_cho = re.search(r"([\d,]+)兆", text)
     m_oku = re.search(r"([\d,]+)億", text)
     m_man = re.search(r"([\d,]+)万", text)
-    if not m_oku and not m_man:
+    if not m_cho and not m_oku and not m_man:
         return None
     total = 0
+    if m_cho:
+        total += int(m_cho.group(1).replace(",", "")) * 10**12
     if m_oku:
         total += int(m_oku.group(1).replace(",", "")) * 10**8
     if m_man:
@@ -600,6 +608,13 @@ def _volume_profile(price_volume_history: list, bins: int = 16) -> dict:
     }
 
 
+def _fmt_yen(price) -> str:
+    """ 3621 -> "3,621円" / 2439.5 -> "2,439.5円" """
+    if price is None:
+        return "-"
+    return f"{price:,}円" if isinstance(price, int) else f"{price:,.2f}".rstrip("0").rstrip(".") + "円"
+
+
 def _fmt_balance(item):
     if item is None:
         return "データなし"
@@ -726,7 +741,7 @@ def _render_stock_section(s: StockSnapshot) -> str:
         price_change_str = f"{s.price_change:+.0f} ({s.change_pct:+.2f}%)"
     elif s.change_pct is not None:
         price_change_str = f"{s.change_pct:+.2f}%"
-    price_str = f"{s.price:,}円" if s.price is not None else "取得失敗"
+    price_str = _fmt_yen(s.price) if s.price is not None else "取得失敗"
     code_line = f"{s.code}" + (f" ・ {s.market}" if s.market else "")
 
     # --- テクニカル(チップ) ---
@@ -799,7 +814,7 @@ def _render_stock_section(s: StockSnapshot) -> str:
     if s.daily_change_history:
         change_rows = []
         for h in s.daily_change_history:
-            price_disp = f"{h['price']:,}円" if h["price"] is not None else "-"
+            price_disp = _fmt_yen(h["price"])
             pct_cls = "up" if (h["change_pct"] or 0) >= 0 else "down"
             pct_disp = f"{h['change_pct']:+.2f}%" if h["change_pct"] is not None else "-"
             zz_cls = "sell-text" if h["zenzougen"] > 0 else "buy-text"
@@ -1097,7 +1112,7 @@ def render_discord_message(snapshots: list, report_url: str) -> str:
     today = _now_jst().strftime("%Y年%m月%d日")
     lines = [f"**需給ウォッチ {today}**", ""]
     for s in snapshots:
-        price_str = f"{s.price:,}円" if s.price is not None else "取得失敗"
+        price_str = _fmt_yen(s.price) if s.price is not None else "取得失敗"
         change_str = f"{s.change_pct:+.2f}%" if s.change_pct is not None else "-"
         rsi = next((i["value"] for i in s.indicators if i["name"].startswith("RSI")), None)
         rsi_str = rsi if rsi else "取得失敗"
