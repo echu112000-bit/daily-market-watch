@@ -43,6 +43,8 @@
 import json
 import os
 import re
+import sys
+import time
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -1123,17 +1125,44 @@ def render_discord_message(snapshots: list, report_url: str) -> str:
     return "\n".join(lines)
 
 
-def send_discord_notification(webhook_url: str, snapshots: list, report_url: str):
-    content = render_discord_message(snapshots, report_url)
-    resp = requests.post(webhook_url, json={"content": content}, timeout=15)
-    if resp.status_code >= 300:
-        print(f"[WARN] Discord通知に失敗しました: {resp.status_code} {resp.text}")
+DEFERRED_MESSAGE_PATH = "discord_message.txt"
+
+
+def post_discord_message(webhook_url: str, content: str, retries: int = 3) -> bool:
+    for attempt in range(retries):
+        try:
+            resp = requests.post(webhook_url, json={"content": content}, timeout=15)
+            if resp.status_code < 300:
+                return True
+            print(f"[WARN] Discord通知に失敗しました: {resp.status_code} {resp.text}")
+        except requests.RequestException as exc:
+            print(f"[WARN] Discord通知に失敗しました: {exc}")
+        if attempt < retries - 1:
+            time.sleep(5)
+    return False
+
+
+def send_deferred_discord():
+    """
+    先に保存しておいたメッセージ(discord_message.txt)をDiscordに送る。
+    GitHub Actions側で「レポートの公開完了を待つ→7:30まで待つ」を済ませてから呼ぶ想定。
+    """
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        print("[INFO] DISCORD_WEBHOOK_URL が未設定のため、Discord通知はスキップしました。")
+        return
+    with open(DEFERRED_MESSAGE_PATH, encoding="utf-8") as f:
+        content = f.read()
+    if not post_discord_message(webhook_url, content):
+        raise SystemExit(1)
+    print("Discordに通知しました。")
 
 
 def notify(report_html: str, snapshots: list):
     """
     レポートを reports/YYYY-MM-DD.html として保存する(GitHub Pagesで公開する前提)。
-    DISCORD_WEBHOOK_URL が設定されていれば、要点とレポートへのリンクをDiscordに通知する。
+    DEFER_DISCORD=1 のときは、Discordへの送信はせずメッセージを discord_message.txt に保存するだけにする
+    (--send-discord で後から送る)。それ以外は DISCORD_WEBHOOK_URL があればその場で通知する。
     """
     date_str = _now_jst().strftime("%Y-%m-%d")
     os.makedirs("reports", exist_ok=True)
@@ -1143,15 +1172,26 @@ def notify(report_html: str, snapshots: list):
     print(f"レポートを {output_path} に保存しました。")
 
     report_url = f"{REPORT_BASE_URL}/{date_str}.html"
+    content = render_discord_message(snapshots, report_url)
+
+    if os.environ.get("DEFER_DISCORD"):
+        with open(DEFERRED_MESSAGE_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"Discord用メッセージを {DEFERRED_MESSAGE_PATH} に保存しました(送信は後続ステップで行う)。")
+        return
 
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
     if webhook_url:
-        send_discord_notification(webhook_url, snapshots, report_url)
+        post_discord_message(webhook_url, content)
     else:
         print("[INFO] DISCORD_WEBHOOK_URL が未設定のため、Discord通知はスキップしました。")
 
 
 def main():
+    if "--send-discord" in sys.argv:
+        send_deferred_discord()
+        return
+
     codes = [t["code"] for t in TICKERS]
     short_data_by_code = fetch_all_short_selling(codes)
 

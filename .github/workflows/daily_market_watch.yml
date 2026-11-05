@@ -1,38 +1,104 @@
 name: Daily Market Watch
 
+# GitHub Actions の schedule は「ベストエフォート」で、混雑時は数時間遅れることがある
+# (実測: 10月上旬は約15分遅れ → 10月下旬以降は2〜5時間遅れ)。
+# そのため、毎朝7:30(JST)ちょうどに通知を届けるために次の方式にしている。
+#   1. 平日の早朝(JST 4:13 / 5:13 / 6:13 / 6:43)に複数回起動する(どれか1回が間に合えばよい)
+#   2. 最初に動いた1回がレポートを作ってpushし、公開(GitHub Pages)の完了を確認する
+#   3. 7:30(JST)になるまで待ってからDiscordに通知する(7:30を過ぎていれば即時通知)
+#   4. 同じ日の2回目以降は、レポートが既にあれば何もせず終了する
+# 起動時刻は混雑しやすい「毎時0分/30分」を避けている。
 on:
   schedule:
-    # 平日(UTC日〜木 = JST月〜金)朝7:30 JST
-    - cron: "30 22 * * 0-4"
+    - cron: "13 19 * * 0-4"   # JST 04:13 (月〜金)
+    - cron: "13 20 * * 0-4"   # JST 05:13
+    - cron: "13 21 * * 0-4"   # JST 06:13
+    - cron: "43 21 * * 0-4"   # JST 06:43
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
+# 定時実行同士は直列化する(同時に動いて二重投稿しないため)。手動実行は影響しない。
+concurrency:
+  group: ${{ github.event_name == 'schedule' && 'daily-market-watch-schedule' || format('manual-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      TZ: Asia/Tokyo
     steps:
       - uses: actions/checkout@v4
 
+      - name: Skip if today's report already exists (scheduled runs only)
+        id: guard
+        run: |
+          TODAY=$(date +%F)
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -f "reports/$TODAY.html" ]; then
+            echo "Today's report ($TODAY) already exists. Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.12"
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Run daily market watch
+      - name: Generate report (Discord message is saved, not sent yet)
+        if: steps.guard.outputs.skip != 'true'
         run: python daily_market_watch.py
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DEFER_DISCORD: "1"
 
       - name: Commit and push report
+        if: steps.guard.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add reports/
-          git diff --cached --quiet || git commit -m "Add report for $(date -u +'%Y-%m-%d')"
+          git diff --cached --quiet || git commit -m "Add report for ${{ steps.guard.outputs.today }}"
+          git pull --rebase
           git push
+
+      - name: Wait until the report is published on GitHub Pages
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          URL="https://echu112000-bit.github.io/daily-market-watch/reports/${{ steps.guard.outputs.today }}.html"
+          for i in $(seq 1 36); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$URL?cb=$RANDOM")
+            if [ "$code" = "200" ]; then echo "Published."; exit 0; fi
+            echo "Not yet published (HTTP $code). Retry $i/36..."
+            sleep 10
+          done
+          echo "::warning::Page was not confirmed within 6 minutes; sending notification anyway."
+
+      - name: Wait until 07:30 JST (scheduled runs only)
+        if: steps.guard.outputs.skip != 'true' && github.event_name == 'schedule'
+        run: |
+          NOW=$(date +%s)
+          TARGET=$(date -d "today 07:30" +%s)
+          if [ "$NOW" -lt "$TARGET" ]; then
+            WAIT=$((TARGET - NOW))
+            echo "Now $(date +%H:%M:%S) JST. Waiting ${WAIT}s until 07:30 JST."
+            sleep "$WAIT"
+          else
+            echo "Already past 07:30 JST ($(date +%H:%M:%S)). Sending immediately."
+          fi
+
+      - name: Send Discord notification
+        if: steps.guard.outputs.skip != 'true'
+        run: python daily_market_watch.py --send-discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
