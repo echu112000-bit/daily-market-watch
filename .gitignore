@@ -3,3 +3,4 @@ discord_message.txt
 __pycache__/
 *.pyc
 .claude/
+diagnostics/

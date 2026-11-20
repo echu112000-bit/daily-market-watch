@@ -218,6 +218,19 @@ FIRM_LOOKBACK_ROWS = 20   # 機関別残高・個人信用残高の「最新判�
 CHART_LOOKBACK_ROWS = 100  # 価格・出来高チャート用に取得する行数(stockscope側のpageSize)
 
 
+def _print_page_diagnostics(code: str, page, status) -> None:
+    """取得失敗時に、実際にどんなページが返っているか(ボット対策画面・ログイン要求など)をログに残す。"""
+    try:
+        title = page.title()
+        text = page.evaluate("() => (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 400)")
+        print(f"[DIAG] {code}: HTTP={status} url={page.url} title={title!r}")
+        print(f"[DIAG] {code}: body={text!r}")
+        os.makedirs("diagnostics", exist_ok=True)
+        page.screenshot(path=os.path.join("diagnostics", f"{code}.png"), full_page=False)
+    except Exception as exc:
+        print(f"[DIAG] {code}: 診断情報の取得に失敗しました({exc})")
+
+
 def fetch_short_selling(code: str, page) -> dict:
     """
     stockscope.app の大口空売り残高ページを、レンダリング済みDOMから取得する。
@@ -236,9 +249,11 @@ def fetch_short_selling(code: str, page) -> dict:
     url = f"https://stockscope.app/outstanding-short-selling-balances/{code}?pageSize={CHART_LOOKBACK_ROWS}"
 
     # サイト側の接続が瞬断されることがあるため、軽くリトライする
+    status = None
     for attempt in range(3):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            status = response.status if response else None
             break
         except Exception as exc:
             if attempt == 2:
@@ -250,6 +265,7 @@ def fetch_short_selling(code: str, page) -> dict:
         page.wait_for_selector(".ant-table-tbody tr", state="attached", timeout=20000)
     except PlaywrightTimeoutError:
         print(f"[WARN] {code}: テーブルの読み込みがタイムアウトしました(サイト構造の変更/要ログインの可能性)。")
+        _print_page_diagnostics(code, page, status)
         return empty
     page.wait_for_timeout(800)  # antdの行描画(最大100行)が落ち着くのを待つ
 
