@@ -1,4 +1,4 @@
 requests
 beautifulsoup4
-playwright
+xlrd
 tzdata; sys_platform == "win32"

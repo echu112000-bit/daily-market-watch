@@ -3,25 +3,28 @@
 =========================================
 
 やること:
-1. stockscope.app から各銘柄の「大口空売り残高」「個人信用残高」の推移を取得
-2. nikkeiyosoku.com から RSI・移動平均乖離・MACD等のテクニカル指標を取得
-3. 見た目付きのHTMLレポート(reports/YYYY-MM-DD.html)を組み立てて保存する
-4. GitHub Pagesで公開したレポートへのリンクをDiscordに通知する
+1. 日本取引所グループ(JPX)の公開ファイルから、各銘柄の「機関別の大口空売り残高」を取得
+2. Yahoo!ファイナンスの公開チャートデータから、株価・出来高(約100営業日)を取得
+3. nikkeiyosoku.com から、個人信用残高(週次)と RSI・MACD等のテクニカル指標を取得
+4. 見た目付きのHTMLレポート(reports/YYYY-MM-DD.html)を組み立てて保存する
+5. GitHub Pagesで公開したレポートへのリンクをDiscordに通知する
 
-■ サイトの実際の構造(2026-09-16 に確認済み)
-  - stockscope.app: Next.js + antd の Table でクライアント側(JS)描画される。
-    単純な requests + BeautifulSoup では表の中身が取得できないため、
-    Playwright でヘッドレスブラウザを操作してレンダリング後のDOMから抽出する。
-    ヘッダーと本体が別々の<table>に分かれており、日付ごとの行は
-    `.ant-table-tbody tr` (document全体から探す)で取得できる。列は
-    [日付, 株価, 出来高, 機関1, 機関2, ..., 機関N, 全増減, 売(個人信用), 買(個人信用)]。
-    機関ごとの残高セルはデータがある日だけ「残高\n増減」の2行、ない日は「-」。
-    機関の一覧・数は銘柄ごとに異なるため、ヘッダー行から動的に取得する。
+■ データ元の変更(2026-11-20)
+  以前は stockscope.app をPlaywrightで読んでいたが、2026-11-09頃から同サイトが
+  GitHub Actions(データセンター)からのアクセスをCloudflareで遮断するようになった
+  (HTTP 403 / 「Just a moment...」)。ボット対策の回避はせず、公開が前提のデータ元に切り替えた。
+  - JPX「空売り残高に関する情報」: 毎営業日の .xls が
+    https://www.jpx.co.jp/markets/public/short-selling/index.html に公開される。
+    対象銘柄の行に、保有機関・空売り残高割合/株数・前回報告時の割合が入っている。
+    増減は「前回報告時の割合」から逆算した概算(発行済株式数が変わらない前提)。
+    割合0.5%未満に下がった機関は報告対象外として一覧から除く。
+  - Yahoo!ファイナンス: https://query1.finance.yahoo.com/v8/finance/chart/<code>.T (日足の終値・出来高)。
   - nikkeiyosoku.com: サーバー側で描画された静的HTMLなので requests + BeautifulSoup で
     そのまま取得できる。`/stock/technical/{code}/` (テクニカル分析タブ) に
     移動平均乖離(5/25/75/200日)、RSI/MACD/モメンタム/サイコロジカル等の指標と
     判定(買/売/無/強/弱/通)、売り・中立・買いシグナルの集計が1ページにまとまっている
     (table.tb-teck の tbody tr = 指標ごとの行)。
+    個人信用残高(週次)は `/stock/margin/{code}/` に、日付・売り残/買い残とその増減・信用倍率がある。
     発行済株式数は公開されていないが、`/stock/{code}/` (株価タブ)の
     table.tb-st-font に「時価総額」(例: 5985億4500万)があるので、
     時価総額 ÷ 株価 で概算し、空売り比率の算出に使う。
@@ -31,13 +34,12 @@
     開示値ではなく時価総額からの逆算(概算)である点に注意。
 
 ■ セットアップ
-  pip install requests beautifulsoup4 playwright
-  playwright install chromium
+  pip install -r requirements.txt
 
 ■ 注意
   各サイトの利用規約を確認し、アクセス頻度(1日1回程度が無難)や
   robots.txt の内容に従うこと。サイトのHTML構造は将来変わる可能性があるため、
-  取得に失敗した場合はブラウザの「検証」機能で構造を再確認すること。
+  取得に失敗した場合はログの [WARN] を確認すること。
 """
 
 import json
@@ -46,8 +48,9 @@ import re
 import sys
 import time
 import requests
+import xlrd
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
@@ -62,12 +65,6 @@ def _now_jst() -> datetime:
     """
     return datetime.now(JST)
 
-
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # 監視したい銘柄一覧(ここに追加していけば対象を増やせる)
@@ -88,45 +85,6 @@ REPORT_BASE_URL = os.environ.get(
     "REPORT_BASE_URL",
     "https://echu112000-bit.github.io/daily-market-watch/reports",
 )
-
-# stockscope.app のレンダリング後DOMから表データを抜き出すJS。
-# 仮想テーブルの計測用の非表示行(日付列が日付形式でない)は除外する。
-EXTRACT_TABLE_JS = """
-() => {
-  const table = document.querySelector('table');
-  if (!table) return null;
-  const headerRows = table.querySelectorAll('.ant-table-thead tr');
-  if (headerRows.length < 2) return null;
-  const subHeaderCells = Array.from(headerRows[1].children).map(th => th.textContent.trim());
-  const numFirms = subHeaderCells.length - 2; // 末尾2列は 売/買(個人信用)
-  const firmNames = subHeaderCells.slice(0, numFirms);
-
-  // 表はヘッダー用とスクロール本体用に別々の<table>に分かれているため、
-  // 本体側は document 全体から .ant-table-tbody を直接探す(祖先を .ant-table-body に限定しない)。
-  const tbody = document.querySelector('.ant-table-tbody');
-  if (!tbody) return null;
-  const trs = Array.from(tbody.querySelectorAll('tr')).filter(tr => {
-    const first = tr.children[0];
-    return first && /^\\d{4}-\\d{2}-\\d{2}/.test(first.innerText.trim());
-  });
-
-  const rows = trs.map(tr => {
-    const cells = Array.from(tr.children).map(td => td.innerText.trim());
-    return {
-      date: cells[0],
-      price: cells[1],
-      volume: cells[2],
-      firms: cells.slice(3, 3 + numFirms),
-      zenzougen: cells[3 + numFirms],
-      sell: cells[3 + numFirms + 1],
-      buy: cells[3 + numFirms + 2],
-    };
-  });
-
-  return { firmNames, rows };
-}
-"""
-
 
 @dataclass
 class StockSnapshot:
@@ -152,46 +110,12 @@ class StockSnapshot:
     charts: dict = field(default_factory=dict)                 # {"price":{"dates":[...],"values":[...]}, "rsi":..., "macd":..., "macd_signal":..., "sma":..., "volume":..., "volume_profile":...}
 
 
-def _parse_price_cell(text: str):
-    """ "3,621円\\n-6.36%" -> (3621, -6.36) / "2,439.5円" のように小数がある銘柄は float で返す """
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    if not lines:
-        return None, None
-    price = None
-    price_text = lines[0].replace(",", "").replace("円", "")
-    try:
-        price = int(price_text)
-    except ValueError:
-        try:
-            price = float(price_text)
-        except ValueError:
-            price = None
-    change_pct = None
-    if len(lines) > 1:
-        try:
-            change_pct = float(lines[1].replace("%", "").replace("+", ""))
-        except ValueError:
-            change_pct = None
-    return price, change_pct
+_WEEKDAYS_JA = "月火水木金土日"
 
 
-def _parse_balance_cell(text: str):
-    """ "1,169,783\\n+198,898" -> (1169783, 198898) / "-" -> (None, None) """
-    text = text.strip()
-    if text in ("", "-"):
-        return None, None
-
-    def to_int(s):
-        s = s.replace(",", "").replace("+", "")
-        try:
-            return int(s)
-        except ValueError:
-            return None
-
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    balance = to_int(lines[0])
-    change = to_int(lines[1]) if len(lines) > 1 else None
-    return balance, change
+def _date_label(d) -> str:
+    """ date(2026, 11, 19) -> "2026-11-19(木)" """
+    return f"{d.isoformat()}({_WEEKDAYS_JA[d.weekday()]})"
 
 
 def _parse_int_cell(text: str):
@@ -214,156 +138,244 @@ def _parse_signed_int(text: str):
         return None
 
 
-FIRM_LOOKBACK_ROWS = 20   # 機関別残高・個人信用残高の「最新判明分」を探す範囲(従来通り)
-CHART_LOOKBACK_ROWS = 100  # 価格・出来高チャート用に取得する行数(stockscope側のpageSize)
+# ---------------------------------------------------------------------------
+# データ取得元
+#   株価・出来高      : Yahoo!ファイナンスの公開チャートデータ
+#   機関別の空売り残高: JPX(日本取引所グループ)が毎営業日公開している「空売り残高に関する情報」
+#   個人信用残高      : nikkeiyosoku.com の信用残高ページ(静的HTML)
+# ---------------------------------------------------------------------------
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{code}.T?range=6mo&interval=1d"
+JPX_BASE_URL = "https://www.jpx.co.jp"
+JPX_SHORT_INDEX_URL = JPX_BASE_URL + "/markets/public/short-selling/index.html"
+SHORT_LOOKBACK_FILES = 20        # 機関別残高の「最新判明分」を探す範囲(直近の公表ファイル数=約20営業日)
+SHORT_REPORT_THRESHOLD = 0.005   # 空売り残高割合0.5%以上が報告対象。これ未満になった機関は「報告対象外」として除く
+CHART_LOOKBACK_ROWS = 100        # 価格・出来高チャート用に使う営業日数
+MARGIN_HISTORY_ROWS = 6          # 個人信用残高(週次)の表示件数
 
 
-def _print_page_diagnostics(code: str, page, status) -> None:
-    """取得失敗時に、実際にどんなページが返っているか(ボット対策画面・ログイン要求など)をログに残す。"""
-    try:
-        title = page.title()
-        text = page.evaluate("() => (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 400)")
-        print(f"[DIAG] {code}: HTTP={status} url={page.url} title={title!r}")
-        print(f"[DIAG] {code}: body={text!r}")
-        os.makedirs("diagnostics", exist_ok=True)
-        page.screenshot(path=os.path.join("diagnostics", f"{code}.png"), full_page=False)
-    except Exception as exc:
-        print(f"[DIAG] {code}: 診断情報の取得に失敗しました({exc})")
-
-
-def fetch_short_selling(code: str, page) -> dict:
+def fetch_price_volume_history(code: str) -> list:
     """
-    stockscope.app の大口空売り残高ページを、レンダリング済みDOMから取得する。
-    機関ごとの残高・個人信用残高は毎日更新されるわけではないため、
-    直近20営業日の中で最新の実データを機関ごとに探す(古すぎる実効性のない
-    データを拾わないため、チャート用の取得件数より狭い範囲にしている)。
-    あわせて、空売り全体の日次増減・個人信用残高の推移、
-    チャート用の価格・出来高の時系列(最大100営業日)も取得する。
+    Yahoo!ファイナンスの公開チャートデータから日足の終値・出来高を取得する(新しい日付が先頭)。
+    [{"date": "2026-11-19", "price": 3160, "volume": 1409500}, ...]
     """
-    empty = {
-        "date": None, "price": None, "change_pct": None, "volume": None,
-        "short_positions": [], "margin_sell": None, "margin_buy": None,
-        "daily_change_history": [], "margin_history": [], "price_volume_history": [],
-    }
-
-    url = f"https://stockscope.app/outstanding-short-selling-balances/{code}?pageSize={CHART_LOOKBACK_ROWS}"
-
-    # サイト側の接続が瞬断されることがあるため、軽くリトライする
-    status = None
-    for attempt in range(3):
-        try:
-            response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            status = response.status if response else None
-            break
-        except Exception as exc:
-            if attempt == 2:
-                print(f"[WARN] {code}: ページの取得に失敗しました({exc})。")
-                return empty
-            page.wait_for_timeout(3000)
-
     try:
-        page.wait_for_selector(".ant-table-tbody tr", state="attached", timeout=20000)
-    except PlaywrightTimeoutError:
-        print(f"[WARN] {code}: テーブルの読み込みがタイムアウトしました(サイト構造の変更/要ログインの可能性)。")
-        _print_page_diagnostics(code, page, status)
-        return empty
-    page.wait_for_timeout(800)  # antdの行描画(最大100行)が落ち着くのを待つ
+        resp = requests.get(YAHOO_CHART_URL.format(code=code), headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        result = resp.json()["chart"]["result"][0]
+        quote = result["indicators"]["quote"][0]
+        timestamps = result.get("timestamp") or []
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        print(f"[WARN] {code}: Yahoo!ファイナンスから株価・出来高を取得できませんでした({exc})。")
+        return []
 
-    raw = page.evaluate(EXTRACT_TABLE_JS)
-    if not raw or not raw["rows"]:
-        print(f"[WARN] {code}: データ行が見つかりませんでした。")
-        return empty
-
-    rows = raw["rows"]           # 新しい日付が先頭、最大 CHART_LOOKBACK_ROWS 件
-    firm_names = raw["firmNames"]
-    recent_rows = rows[:FIRM_LOOKBACK_ROWS]  # 機関別残高などは従来通り直近20日のみ対象
-
-    latest = rows[0]
-    price, change_pct = _parse_price_cell(latest["price"])
-    volume = _parse_int_cell(latest["volume"])
-
-    short_positions = []
-    for i, firm in enumerate(firm_names):
-        for row in recent_rows:
-            balance, change = _parse_balance_cell(row["firms"][i])
-            if balance is not None:
-                short_positions.append({
-                    "firm": firm, "balance": balance, "change": change, "date": row["date"],
-                })
-                break
-
-    margin_sell = None
-    margin_buy = None
-    margin_history = []
-    for row in recent_rows:
-        sell_balance, sell_change = _parse_balance_cell(row["sell"])
-        buy_balance, buy_change = _parse_balance_cell(row["buy"])
-        if margin_sell is None and sell_balance is not None:
-            margin_sell = {"balance": sell_balance, "change": sell_change, "date": row["date"]}
-        if margin_buy is None and buy_balance is not None:
-            margin_buy = {"balance": buy_balance, "change": buy_change, "date": row["date"]}
-        if sell_balance is not None or buy_balance is not None:
-            ratio = (buy_balance / sell_balance) if sell_balance else None
-            margin_history.append({
-                "date": row["date"],
-                "sell_balance": sell_balance, "sell_change": sell_change,
-                "buy_balance": buy_balance, "buy_change": buy_change,
-                "ratio": ratio,
-            })
-    # recent_rows は新しい日付が先頭のまま(降順)にしておく
-
-    daily_change_history = []
-    for row in recent_rows:
-        zenzougen = _parse_signed_int(row["zenzougen"])
-        if not zenzougen:  # None または 0(変化なし)は除外
+    now = _now_jst()
+    market_closed_today = (now.hour, now.minute) >= (15, 35)   # 東証の大引けは15:30
+    history = []
+    for ts, close, volume in zip(timestamps, quote.get("close", []), quote.get("volume", [])):
+        if close is None or volume is None:
             continue
-        row_price, row_change_pct = _parse_price_cell(row["price"])
-        daily_change_history.append({
-            "date": row["date"], "price": row_price, "change_pct": row_change_pct, "zenzougen": zenzougen,
+        price = int(close) if float(close).is_integer() else round(float(close), 2)
+        day = datetime.fromtimestamp(ts, tz=JST).date()
+        if day == now.date() and not market_closed_today:
+            continue   # 立会時間中の「本日の未確定の足」は、終値ベースのレポートには含めない
+        history.append({"date": day.isoformat(), "price": price, "volume": int(volume)})
+    history.sort(key=lambda h: h["date"], reverse=True)
+    return history[:CHART_LOOKBACK_ROWS]
+
+
+def fetch_margin_history(code: str) -> list:
+    """
+    nikkeiyosoku.com の信用残高ページ(週次)から、売り残・買い残とその増減を取得する(新しい日付が先頭)。
+    """
+    url = f"https://nikkeiyosoku.com/stock/margin/{code}/"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"[WARN] {code}: 信用残高ページを取得できませんでした({exc})。")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    history = []
+    for tr in soup.select("table tbody tr"):
+        tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(tds) < 6 or not re.match(r"\d{4}/\d{1,2}/\d{1,2}$", tds[0]):
+            continue
+        year, month, day = (int(x) for x in tds[0].split("/"))
+        sell_balance = _parse_int_cell(tds[1])
+        buy_balance = _parse_int_cell(tds[3])
+        try:
+            ratio = float(tds[5])
+        except ValueError:
+            ratio = None
+        history.append({
+            "date": _date_label(date(year, month, day)),
+            "sell_balance": sell_balance, "sell_change": _parse_signed_int(tds[2]),
+            "buy_balance": buy_balance, "buy_change": _parse_signed_int(tds[4]),
+            "ratio": ratio,
         })
-    # recent_rows は新しい日付が先頭のまま(降順)にしておく
-
-    # チャート(価格・出来高・価格帯別出来高)用に、取得した全行(最大100日分)の価格と出来高を拾っておく
-    price_volume_history = []
-    for row in rows:
-        row_price, _ = _parse_price_cell(row["price"])
-        row_volume = _parse_int_cell(row["volume"])
-        date_match = re.match(r"\d{4}-\d{2}-\d{2}", row["date"])
-        if row_price is not None and row_volume is not None and date_match:
-            price_volume_history.append({"date": date_match.group(), "price": row_price, "volume": row_volume})
-
-    return {
-        "date": latest["date"],
-        "price": price,
-        "change_pct": change_pct,
-        "volume": volume,
-        "short_positions": short_positions,
-        "margin_sell": margin_sell,
-        "margin_buy": margin_buy,
-        "margin_history": margin_history,
-        "daily_change_history": daily_change_history,
-        "price_volume_history": price_volume_history,
-    }
+    return history[:MARGIN_HISTORY_ROWS]
 
 
-def fetch_all_short_selling(codes: list) -> dict:
-    """複数銘柄分をブラウザ1つ使い回しで取得する。"""
-    if not PLAYWRIGHT_AVAILABLE:
-        print("[ERROR] playwright がインストールされていません。"
-              "`pip install playwright` と `playwright install chromium` を実行してください。")
-        return {code: {} for code in codes}
+def _list_jpx_short_files(limit: int) -> list:
+    """ JPXの公開ページから、直近の日次ファイル [(YYYYMMDD, URL), ...] を新しい順に返す。 """
+    resp = requests.get(JPX_SHORT_INDEX_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    found = {}
+    for href, ymd in re.findall(r'href="([^"]+?/(\d{8})_Short_Positions\.xls)"', resp.text):
+        found.setdefault(ymd, href if href.startswith("http") else JPX_BASE_URL + href)
+    return sorted(found.items(), reverse=True)[:limit]
+
+
+def _jpx_cell_to_date(value, datemode):
+    if isinstance(value, float):
+        return xlrd.xldate_as_datetime(value, datemode).date()
+    match = re.match(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", str(value).strip())
+    return date(int(match.group(1)), int(match.group(2)), int(match.group(3))) if match else None
+
+
+def _read_jpx_short_file(content: bytes, wanted_codes: set) -> list:
+    """ 日次ファイル(.xls)から、対象銘柄の行だけを取り出す。 """
+    book = xlrd.open_workbook(file_contents=content)
+    sheet = book.sheet_by_index(0)
+    header_row = next(
+        (i for i in range(min(sheet.nrows, 30)) if any("銘柄コード" in str(c) for c in sheet.row_values(i))), None
+    )
+    if header_row is None:
+        raise ValueError("ヘッダー行(銘柄コード)が見つかりません")
+
+    col = {}
+    for idx, cell in enumerate(sheet.row_values(header_row)):
+        text = str(cell)
+        for key, label in (
+            ("calc_date", "計算年月日"), ("code", "銘柄コード"), ("seller", "商号・名称・氏名"),
+            ("fund", "信託財産・運用財産の名称"), ("ratio", "空売り残高割合"), ("shares", "空売り残高数量"),
+            ("prev_ratio", "直近空売り残高割合"),
+        ):
+            if label in text and key not in col and not (key == "calc_date" and "直近" in text):
+                col[key] = idx
+    missing = {"calc_date", "code", "seller", "ratio", "shares"} - set(col)
+    if missing:
+        raise ValueError(f"想定した列が見つかりません: {sorted(missing)}")
+
+    records = []
+    for r in range(header_row + 2, sheet.nrows):   # 見出しは日本語/英語の2行
+        row = sheet.row_values(r)
+        raw_code = row[col["code"]]
+        code = str(int(raw_code)) if isinstance(raw_code, float) else str(raw_code).strip()
+        if len(code) == 5 and code.endswith("0"):
+            code = code[:4]
+        if code not in wanted_codes:
+            continue
+        calc_date = _jpx_cell_to_date(row[col["calc_date"]], book.datemode)
+        try:
+            ratio = float(row[col["ratio"]])
+            shares = int(float(row[col["shares"]]))
+        except (TypeError, ValueError):
+            continue
+        prev_ratio = row[col["prev_ratio"]] if "prev_ratio" in col else ""
+        prev_ratio = float(prev_ratio) if isinstance(prev_ratio, float) and prev_ratio > 0 else None
+        fund = str(row[col["fund"]]).strip() if "fund" in col else ""
+        records.append({
+            "code": code, "calc_date": calc_date, "ratio": ratio, "shares": shares, "prev_ratio": prev_ratio,
+            "firm": fund or str(row[col["seller"]]).strip(),
+        })
+    return records
+
+
+def fetch_jpx_short_records(codes: list) -> list:
+    """ JPXの直近の日次ファイルをまとめて読み、対象銘柄の報告レコードを新しい公表日の順に返す。 """
+    try:
+        files = _list_jpx_short_files(SHORT_LOOKBACK_FILES)
+    except requests.RequestException as exc:
+        print(f"[WARN] JPXの空売り残高ファイル一覧を取得できませんでした({exc})。")
+        return []
+
+    wanted = set(codes)
+    records = []
+    for ymd, url in files:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=60)
+            resp.raise_for_status()
+            records.extend(_read_jpx_short_file(resp.content, wanted))
+        except (requests.RequestException, ValueError, xlrd.XLRDError) as exc:
+            print(f"[WARN] JPX {ymd} のファイルを読み込めませんでした({exc})。")
+    return records
+
+
+def _build_short_data(code: str, records: list, price_by_date: dict) -> dict:
+    """ 1銘柄分の機関別残高(最新判明分)と、空売り全体の日次増減を組み立てる。 """
+    mine = [r for r in records if r["code"] == code and r["calc_date"]]
+
+    def change_of(r):
+        if not r["prev_ratio"] or not r["ratio"]:
+            return None
+        return r["shares"] - round(r["shares"] * r["prev_ratio"] / r["ratio"])
+
+    # 機関ごとに最新の報告だけを採用し、0.5%未満(報告対象外)に下がっていれば除外する
+    latest = {}
+    for r in sorted(mine, key=lambda x: x["calc_date"], reverse=True):
+        latest.setdefault(r["firm"], r)
+    short_positions = [
+        {"firm": firm, "balance": r["shares"], "change": change_of(r), "date": _date_label(r["calc_date"])}
+        for firm, r in latest.items() if r["ratio"] >= SHORT_REPORT_THRESHOLD
+    ]
+
+    daily = {}
+    for r in mine:
+        change = change_of(r)
+        if change is not None:
+            daily[r["calc_date"]] = daily.get(r["calc_date"], 0) + change
+    daily_change_history = []
+    for day in sorted(daily, reverse=True):
+        if daily[day] == 0:
+            continue
+        info = price_by_date.get(day.isoformat(), {})
+        daily_change_history.append({
+            "date": _date_label(day), "price": info.get("price"),
+            "change_pct": info.get("change_pct"), "zenzougen": daily[day],
+        })
+    return {"short_positions": short_positions, "daily_change_history": daily_change_history}
+
+
+def fetch_all_market_data(codes: list) -> dict:
+    """
+    銘柄ごとに、株価・出来高(Yahoo)・機関別空売り(JPX)・個人信用残高(nikkeiyosoku)をまとめて取得する。
+    戻り値は build_snapshot() が受け取る形式({code: {...}})。
+    """
+    histories = {code: fetch_price_volume_history(code) for code in codes}
+    jpx_records = fetch_jpx_short_records(codes)
 
     result = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=HEADERS["User-Agent"])
-        for code in codes:
-            try:
-                result[code] = fetch_short_selling(code, page)
-            except PlaywrightTimeoutError:
-                print(f"[WARN] {code}: ページの読み込みがタイムアウトしました。")
-                result[code] = {}
-        browser.close()
+    for code in codes:
+        history = histories[code]
+        price_by_date = {}
+        for i, h in enumerate(history):
+            prev = history[i + 1]["price"] if i + 1 < len(history) else None
+            price_by_date[h["date"]] = {
+                "price": h["price"],
+                "change": round(h["price"] - prev, 2) if prev else None,
+                "change_pct": round((h["price"] / prev - 1) * 100, 2) if prev else None,
+            }
+
+        margin_history = fetch_margin_history(code)
+        data = _build_short_data(code, jpx_records, price_by_date)
+        latest = history[0] if history else None
+        latest_info = price_by_date.get(latest["date"], {}) if latest else {}
+        data.update({
+            "date": _date_label(date.fromisoformat(latest["date"])) if latest else None,
+            "price": latest["price"] if latest else None,
+            "change": latest_info.get("change"),
+            "change_pct": latest_info.get("change_pct"),
+            "volume": latest["volume"] if latest else None,
+            "price_volume_history": history,
+            "margin_history": margin_history,
+            "margin_sell": next(({"balance": m["sell_balance"], "change": m["sell_change"], "date": m["date"]}
+                                 for m in margin_history if m["sell_balance"] is not None), None),
+            "margin_buy": next(({"balance": m["buy_balance"], "change": m["buy_change"], "date": m["date"]}
+                                for m in margin_history if m["buy_balance"] is not None), None),
+        })
+        result[code] = data
     return result
 
 
@@ -387,7 +399,7 @@ def fetch_technical_indicators(code: str) -> dict:
     result["indicators"] = []
     result["summary_counts"] = {}
 
-    # 前日比(円)。%はstockscope側の値を使うのでここでは絶対値のみ利用する。
+    # 前日比(円)。%はYahoo!ファイナンスの終値から計算した値を使うのでここでは絶対値のみ利用する。
     price_texts = soup.select(".stockprice-text")
     if len(price_texts) >= 2:
         change_span = price_texts[1].find("span")
@@ -571,18 +583,29 @@ def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
 
     tech_data = fetch_technical_indicators(ticker["code"])
     snap.market = tech_data.get("market")
-    snap.price_change = tech_data.get("price_change")
+    # 前日比(円)は、騰落率と同じYahoo!の終値系列から計算した値を優先する(取れなければnikkeiyosoku)
+    snap.price_change = short_data.get("change") if short_data.get("change") is not None else tech_data.get("price_change")
     snap.ma_deviation = tech_data.get("ma_deviation", {})
     snap.indicators = tech_data.get("indicators", [])
     snap.summary_counts = tech_data.get("summary_counts", {})
+
+    snap.charts = fetch_chart_series(ticker["code"], ticker["name"])
+
+    # Yahoo!から株価を取れなかった場合の保険として、nikkeiyosoku の株価系列の最新値で補う
+    fallback_dates = snap.charts.get("price", {}).get("dates", [])
+    fallback_values = snap.charts.get("price", {}).get("values", [])
+    if snap.price is None and fallback_values:
+        snap.price = fallback_values[-1]
+        snap.date = _date_label(date.fromisoformat(fallback_dates[-1]))
+        if len(fallback_values) >= 2 and fallback_values[-2]:
+            snap.change_pct = round((fallback_values[-1] / fallback_values[-2] - 1) * 100, 2)
+        print(f"[WARN] {ticker['code']}: 株価をnikkeiyosokuの値で代替しました(出来高は取得できていません)。")
 
     market_cap = fetch_market_cap(ticker["code"])
     if market_cap and snap.price:
         snap.shares_outstanding = round(market_cap / snap.price)
     if snap.short_positions_total and snap.shares_outstanding:
         snap.short_ratio = snap.short_positions_total / snap.shares_outstanding * 100
-
-    snap.charts = fetch_chart_series(ticker["code"], ticker["name"])
 
     price_volume_history = short_data.get("price_volume_history", [])
     volume_by_date = {h["date"]: h["volume"] for h in price_volume_history}
@@ -756,7 +779,8 @@ def _render_stock_section(s: StockSnapshot) -> str:
     up_down = "up" if (s.change_pct or 0) >= 0 else "down"
     price_change_str = ""
     if s.price_change is not None and s.change_pct is not None:
-        price_change_str = f"{s.price_change:+.0f} ({s.change_pct:+.2f}%)"
+        change_text = f"{s.price_change:+.2f}".rstrip("0").rstrip(".")
+        price_change_str = f"{change_text} ({s.change_pct:+.2f}%)"
     elif s.change_pct is not None:
         price_change_str = f"{s.change_pct:+.2f}%"
     price_str = _fmt_yen(s.price) if s.price is not None else "取得失敗"
@@ -946,7 +970,7 @@ CHART_SCRIPT = """
 // 全チャートの左軸(Y軸)の幅をそろえるため、数字を等幅フォント+固定桁数でパディングする。
 // (Chart.jsのscale.afterFitでwidthを強制しても、後続のレイアウト計算で上書きされて
 //  効かないことがあるため、ラベル文字数を物理的にそろえる方式にしている)
-const TICK_LABEL_WIDTH = 9;
+const TICK_LABEL_WIDTH = __TICK_LABEL_WIDTH__;
 const MONO_FONT = '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace';
 function padTick(value) {
   if (value === null || value === undefined) return '';
@@ -1094,6 +1118,13 @@ def render_html_report(snapshots: list) -> str:
     sections = "".join(_render_stock_section(s) for s in snapshots)
     chart_data_json = json.dumps({s.code: s.charts for s in snapshots}, ensure_ascii=False)
 
+    # 全銘柄・全チャートでY軸の目盛り幅をそろえるため、最大出来高(軸の最大値は少し上に丸められる)の桁数に合わせる
+    max_volume = max(
+        (v for s in snapshots for v in s.charts.get("volume", {}).get("values", []) if v), default=0
+    )
+    tick_label_width = max(9, len(f"{int(max_volume * 1.3):,}"))
+    chart_script = CHART_SCRIPT.replace("__TICK_LABEL_WIDTH__", str(tick_label_width))
+
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1110,13 +1141,13 @@ def render_html_report(snapshots: list) -> str:
   </header>
   {sections}
   <footer>
-    データ出典:株ビジョン(stockscope.app)、投資の森(nikkeiyosoku.com)の公開情報をもとに自動生成した参考資料です。投資判断はご自身でお願いします。
+    データ出典:日本取引所グループ(空売り残高)、Yahoo!ファイナンス(株価・出来高)、投資の森(nikkeiyosoku.com)の公開情報をもとに自動生成した参考資料です。投資判断はご自身でお願いします。
   </footer>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <script>
 const CHART_DATA = {chart_data_json};
-{CHART_SCRIPT}
+{chart_script}
 </script>
 </body>
 </html>"""
@@ -1209,7 +1240,7 @@ def main():
         return
 
     codes = [t["code"] for t in TICKERS]
-    short_data_by_code = fetch_all_short_selling(codes)
+    short_data_by_code = fetch_all_market_data(codes)
 
     snapshots = [
         build_snapshot(t, short_data_by_code.get(t["code"], {}))

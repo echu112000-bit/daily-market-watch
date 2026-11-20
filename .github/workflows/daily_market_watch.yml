@@ -52,24 +52,13 @@ jobs:
 
       - name: Install dependencies
         if: steps.guard.outputs.skip != 'true'
-        run: |
-          pip install -r requirements.txt
-          playwright install --with-deps chromium
+        run: pip install -r requirements.txt
 
       - name: Generate report (Discord message is saved, not sent yet)
         if: steps.guard.outputs.skip != 'true'
         run: python daily_market_watch.py
         env:
           DEFER_DISCORD: "1"
-
-      - name: Upload diagnostics (only exists when fetching failed)
-        if: always() && steps.guard.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: diagnostics
-          path: diagnostics/
-          if-no-files-found: ignore
-          retention-days: 7
 
       - name: Commit and push report
         if: steps.guard.outputs.skip != 'true'
