@@ -4,7 +4,7 @@
 
 やること:
 1. 日本取引所グループ(JPX)の公開ファイルから、各銘柄の「機関別の大口空売り残高」を取得
-2. Yahoo!ファイナンスの公開チャートデータから、株価・出来高(約100営業日)を取得
+2. Yahoo Financeの公開チャートデータから、株価・出来高(約100営業日)を取得
 3. nikkeiyosoku.com から、個人信用残高(週次)と RSI・MACD等のテクニカル指標を取得
 4. 見た目付きのHTMLレポート(reports/YYYY-MM-DD.html)を組み立てて保存する
 5. GitHub Pagesで公開したレポートへのリンクをDiscordに通知する
@@ -18,7 +18,7 @@
     対象銘柄の行に、保有機関・空売り残高割合/株数・前回報告時の割合が入っている。
     増減は「前回報告時の割合」から逆算した概算(発行済株式数が変わらない前提)。
     割合0.5%未満に下がった機関は報告対象外として一覧から除く。
-  - Yahoo!ファイナンス: https://query1.finance.yahoo.com/v8/finance/chart/<code>.T (日足の終値・出来高)。
+  - Yahoo Finance: https://query1.finance.yahoo.com/v8/finance/chart/<code>.T (日足の終値・出来高)。
   - nikkeiyosoku.com: サーバー側で描画された静的HTMLなので requests + BeautifulSoup で
     そのまま取得できる。`/stock/technical/{code}/` (テクニカル分析タブ) に
     移動平均乖離(5/25/75/200日)、RSI/MACD/モメンタム/サイコロジカル等の指標と
@@ -140,7 +140,7 @@ def _parse_signed_int(text: str):
 
 # ---------------------------------------------------------------------------
 # データ取得元
-#   株価・出来高      : Yahoo!ファイナンスの公開チャートデータ
+#   株価・出来高      : Yahoo Financeの公開チャートデータ
 #   機関別の空売り残高: JPX(日本取引所グループ)が毎営業日公開している「空売り残高に関する情報」
 #   個人信用残高      : nikkeiyosoku.com の信用残高ページ(静的HTML)
 # ---------------------------------------------------------------------------
@@ -155,7 +155,7 @@ MARGIN_HISTORY_ROWS = 6          # 個人信用残高(週次)の表示件数
 
 def fetch_price_volume_history(code: str) -> list:
     """
-    Yahoo!ファイナンスの公開チャートデータから日足の終値・出来高を取得する(新しい日付が先頭)。
+    Yahoo Financeの公開チャートデータから日足の終値・出来高を取得する(新しい日付が先頭)。
     [{"date": "2026-11-19", "price": 3160, "volume": 1409500}, ...]
     """
     try:
@@ -165,7 +165,7 @@ def fetch_price_volume_history(code: str) -> list:
         quote = result["indicators"]["quote"][0]
         timestamps = result.get("timestamp") or []
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
-        print(f"[WARN] {code}: Yahoo!ファイナンスから株価・出来高を取得できませんでした({exc})。")
+        print(f"[WARN] {code}: Yahoo Financeから株価・出来高を取得できませんでした({exc})。")
         return []
 
     now = _now_jst()
@@ -399,7 +399,7 @@ def fetch_technical_indicators(code: str) -> dict:
     result["indicators"] = []
     result["summary_counts"] = {}
 
-    # 前日比(円)。%はYahoo!ファイナンスの終値から計算した値を使うのでここでは絶対値のみ利用する。
+    # 前日比(円)。%はYahoo Financeの終値から計算した値を使うのでここでは絶対値のみ利用する。
     price_texts = soup.select(".stockprice-text")
     if len(price_texts) >= 2:
         change_span = price_texts[1].find("span")
@@ -1141,7 +1141,7 @@ def render_html_report(snapshots: list) -> str:
   </header>
   {sections}
   <footer>
-    データ出典:日本取引所グループ(空売り残高)、Yahoo!ファイナンス(株価・出来高)、投資の森(nikkeiyosoku.com)の公開情報をもとに自動生成した参考資料です。投資判断はご自身でお願いします。
+    データ出典:日本取引所グループ(空売り残高)、Yahoo Finance(株価・出来高)、投資の森(nikkeiyosoku.com)の公開情報をもとに自動生成した参考資料です。投資判断はご自身でお願いします。
   </footer>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
