@@ -65,7 +65,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports/
+          git add reports/ data/
           git diff --cached --quiet || git commit -m "Add report for ${{ steps.guard.outputs.today }}"
           git pull --rebase
           git push

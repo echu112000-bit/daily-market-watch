@@ -5,7 +5,7 @@
 やること:
 1. 日本取引所グループ(JPX)の公開ファイルから、各銘柄の「機関別の大口空売り残高」を取得
 2. Yahoo Financeの公開チャートデータから、株価・出来高(約100営業日)を取得
-3. nikkeiyosoku.com から、個人信用残高(週次)と RSI・MACD等のテクニカル指標を取得
+3. JPXの日次PDFから個人信用残高(日次)を、nikkeiyosoku.com から RSI・MACD等のテクニカル指標を取得
 4. 見た目付きのHTMLレポート(reports/YYYY-MM-DD.html)を組み立てて保存する
 5. GitHub Pagesで公開したレポートへのリンクをDiscordに通知する
 
@@ -24,7 +24,8 @@
     移動平均乖離(5/25/75/200日)、RSI/MACD/モメンタム/サイコロジカル等の指標と
     判定(買/売/無/強/弱/通)、売り・中立・買いシグナルの集計が1ページにまとまっている
     (table.tb-teck の tbody tr = 指標ごとの行)。
-    個人信用残高(週次)は `/stock/margin/{code}/` に、日付・売り残/買い残とその増減・信用倍率がある。
+    個人信用残高(週次)は `/stock/margin/{code}/` に、日付・売り残/買い残とその増減・信用倍率がある
+    (JPXの日次PDFが取れないときの代替として使う)。
     発行済株式数は公開されていないが、`/stock/{code}/` (株価タブ)の
     table.tb-st-font に「時価総額」(例: 5985億4500万)があるので、
     時価総額 ÷ 株価 で概算し、空売り比率の算出に使う。
@@ -42,11 +43,13 @@
   取得に失敗した場合はログの [WARN] を確認すること。
 """
 
+import io
 import json
 import os
 import re
 import sys
 import time
+import pdfplumber
 import requests
 import xlrd
 from bs4 import BeautifulSoup
@@ -107,6 +110,7 @@ class StockSnapshot:
     margin_sell: dict = None                                  # {"balance","change","date"}
     margin_buy: dict = None
     margin_history: list = field(default_factory=list)        # [{"date","sell_balance","sell_change","buy_balance","buy_change","ratio"}]
+    margin_cadence: str = "週次"                               # 個人信用残高の更新頻度(日次=JPXの日次PDF / 週次=nikkeiyosoku)
     charts: dict = field(default_factory=dict)                 # {"price":{"dates":[...],"values":[...]}, "rsi":..., "macd":..., "macd_signal":..., "sma":..., "volume":..., "volume_profile":...}
 
 
@@ -338,6 +342,127 @@ def _build_short_data(code: str, records: list, price_by_date: dict) -> dict:
     return {"short_positions": short_positions, "daily_change_history": daily_change_history}
 
 
+JPX_MARGIN_INDEX_URL = JPX_BASE_URL + "/markets/statistics-equities/margin/01.html"
+MARGIN_STORE_PATH = os.path.join("data", "margin_daily.json")
+MARGIN_DAILY_ROWS = 10           # 個人信用残高(日次)の表示件数
+MARGIN_DAILY_KEEP_DAYS = 400     # 保存しておく日数(これより古いものは削除)
+
+
+def _load_margin_store() -> dict:
+    """ {"4385": {"2026-11-20": {"sell":.., "sell_change":.., "buy":.., "buy_change":..}}} """
+    try:
+        with open(MARGIN_STORE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_margin_store(store: dict) -> None:
+    for code in store:
+        days = sorted(store[code], reverse=True)[:MARGIN_DAILY_KEEP_DAYS]
+        store[code] = {d: store[code][d] for d in sorted(days)}
+    os.makedirs(os.path.dirname(MARGIN_STORE_PATH), exist_ok=True)
+    with open(MARGIN_STORE_PATH, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+def _list_jpx_margin_files() -> list:
+    """ JPX「銘柄別信用取引残高」の日次PDF [(YYYYMMDD, URL), ...] を新しい順に返す(直近5営業日分が公開される)。 """
+    resp = requests.get(JPX_MARGIN_INDEX_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    found = {}
+    for href, ymd in re.findall(r'href="([^"]+?/(\d{8})_mtall\.pdf)"', resp.text):
+        found.setdefault(ymd, href if href.startswith("http") else JPX_BASE_URL + href)
+    return sorted(found.items(), reverse=True)
+
+
+def _read_jpx_margin_pdf(content: bytes, wanted_codes: set) -> dict:
+    """
+    銘柄別信用取引残高PDFから、対象銘柄の売残高・買残高(株数)と前日比を取り出す。
+    株数の行は「<5桁コード> JPxxxxxxxxxx株数 Shs. 売残高 前日比 上場比% 買残高 前日比 上場比% 内訳×8」の並び。
+    ▲は減少。コード順に並んでいるので、全銘柄が見つかった時点で読むのをやめる。
+    """
+    line_pat = re.compile(r"(\d{5}) JP\w{10}株数 Shs\.(.*)")
+    token_pat = re.compile(r"(▲\s*)?(\d[\d,]*(?:\.\d+)?)(%)?")
+    wanted5 = {code + "0": code for code in wanted_codes}
+    found = {}
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
+        for page in pdf.pages:
+            for line in (page.extract_text() or "").split("\n"):
+                m = line_pat.search(line)
+                if not m or m.group(1) not in wanted5:
+                    continue
+                values = []
+                for sign, num, pct in token_pat.findall(m.group(2)):
+                    if pct:   # 上場比(%)は使わない
+                        continue
+                    v = int(num.replace(",", ""))
+                    values.append(-v if sign else v)
+                if len(values) < 12:
+                    raise ValueError(f"想定した列数ではありません({m.group(1)}: {len(values)}列)")
+                # 内訳(一般+制度)が合計と一致するかで、列の並びが想定通りか確かめる
+                if values[4] + values[6] != values[0] or values[8] + values[10] != values[2]:
+                    raise ValueError(f"売り・買いの内訳が合計と一致しません({m.group(1)})")
+                found[wanted5[m.group(1)]] = {
+                    "sell": values[0], "sell_change": values[1], "buy": values[2], "buy_change": values[3],
+                }
+            if len(found) == len(wanted5):
+                break
+    return found
+
+
+def update_margin_store(codes: list) -> dict:
+    """
+    JPXの日次PDFのうち、まだ保存していない日付だけを取りに行き、保存ファイルに追記して返す。
+    (PDFは1つ解析するのに数十秒かかるため。公開されるのは直近5営業日分だけなので、毎日取り込んで蓄積する)
+    """
+    store = _load_margin_store()
+    try:
+        files = _list_jpx_margin_files()
+    except requests.RequestException as exc:
+        print(f"[WARN] JPXの銘柄別信用取引残高のファイル一覧を取得できませんでした({exc})。")
+        return store
+
+    changed = False
+    for ymd, url in files:
+        day = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+        if all(day in store.get(code, {}) for code in codes):
+            continue
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=120)
+            resp.raise_for_status()
+            rows = _read_jpx_margin_pdf(resp.content, set(codes))
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[WARN] JPX {ymd} の信用取引残高PDFを読み込めませんでした({exc})。")
+            continue
+        for code, row in rows.items():
+            store.setdefault(code, {})[day] = row
+            changed = True
+        missing = set(codes) - set(rows)
+        if missing:
+            print(f"[WARN] JPX {ymd} の信用取引残高PDFに銘柄が見つかりませんでした: {sorted(missing)}")
+    if changed:
+        _save_margin_store(store)
+    return store
+
+
+def _margin_history_from_store(store: dict, code: str) -> list:
+    """ 保存した日次データを、表示用の形式(新しい日付が先頭)に変換する。 """
+    days = store.get(code, {})
+    history = []
+    for day in sorted(days, reverse=True)[:MARGIN_DAILY_ROWS]:
+        row = days[day]
+        sell, buy = row["sell"], row["buy"]
+        history.append({
+            "date": _date_label(date.fromisoformat(day)),
+            "sell_balance": sell, "sell_change": row["sell_change"],
+            "buy_balance": buy, "buy_change": row["buy_change"],
+            # 売り残が買い残の1/100未満だと倍率が数百倍になり実態を表さないため、倍率は出さない
+            "ratio": (buy / sell) if sell and sell * 100 >= buy else None,
+        })
+    return history
+
+
 def fetch_all_market_data(codes: list) -> dict:
     """
     銘柄ごとに、株価・出来高(Yahoo)・機関別空売り(JPX)・個人信用残高(nikkeiyosoku)をまとめて取得する。
@@ -345,6 +470,7 @@ def fetch_all_market_data(codes: list) -> dict:
     """
     histories = {code: fetch_price_volume_history(code) for code in codes}
     jpx_records = fetch_jpx_short_records(codes)
+    margin_store = update_margin_store(codes)
 
     result = {}
     for code in codes:
@@ -358,7 +484,12 @@ def fetch_all_market_data(codes: list) -> dict:
                 "change_pct": round((h["price"] / prev - 1) * 100, 2) if prev else None,
             }
 
-        margin_history = fetch_margin_history(code)
+        margin_history = _margin_history_from_store(margin_store, code)
+        margin_cadence = "日次"
+        if not margin_history:
+            print(f"[WARN] {code}: JPXの日次の信用残高が無いため、nikkeiyosokuの週次データで代替します。")
+            margin_history = fetch_margin_history(code)
+            margin_cadence = "週次"
         data = _build_short_data(code, jpx_records, price_by_date)
         latest = history[0] if history else None
         latest_info = price_by_date.get(latest["date"], {}) if latest else {}
@@ -370,6 +501,7 @@ def fetch_all_market_data(codes: list) -> dict:
             "volume": latest["volume"] if latest else None,
             "price_volume_history": history,
             "margin_history": margin_history,
+            "margin_cadence": margin_cadence,
             "margin_sell": next(({"balance": m["sell_balance"], "change": m["sell_change"], "date": m["date"]}
                                  for m in margin_history if m["sell_balance"] is not None), None),
             "margin_buy": next(({"balance": m["buy_balance"], "change": m["buy_change"], "date": m["date"]}
@@ -580,6 +712,7 @@ def build_snapshot(ticker: dict, short_data: dict) -> StockSnapshot:
     snap.margin_sell = short_data.get("margin_sell")
     snap.margin_buy = short_data.get("margin_buy")
     snap.margin_history = short_data.get("margin_history", [])
+    snap.margin_cadence = short_data.get("margin_cadence", "週次")
 
     tech_data = fetch_technical_indicators(ticker["code"])
     snap.market = tech_data.get("market")
@@ -880,7 +1013,18 @@ def _render_stock_section(s: StockSnapshot) -> str:
     # --- 個人信用残高(週次) ---
     if s.margin_history:
         has_ratio = any(m["ratio"] for m in s.margin_history)
-        header_cols = "<th>日付</th><th>売り残</th><th>買い残</th>" + ("<th>倍率</th>" if has_ratio else "")
+        has_change = any(m["sell_change"] is not None or m["buy_change"] is not None for m in s.margin_history)
+
+        def change_cell(value):
+            if value is None:
+                return "<td class='num'>-</td>"
+            return f"<td class='num'>{value:+,}</td>"
+
+        header_cols = (
+            "<th>日付</th><th>売り残</th>" + ("<th>増減</th>" if has_change else "")
+            + "<th>買い残</th>" + ("<th>増減</th>" if has_change else "")
+            + ("<th>倍率</th>" if has_ratio else "")
+        )
         margin_rows = []
         for m in s.margin_history:
             sell_disp = f"{m['sell_balance']:,}" if m["sell_balance"] is not None else "-"
@@ -891,10 +1035,12 @@ def _render_stock_section(s: StockSnapshot) -> str:
                 ratio_cell = ""
             margin_rows.append(
                 f"<tr><td>{m['date']}</td><td class='num'>{sell_disp}</td>"
-                f"<td class='num'>{buy_disp}</td>{ratio_cell}</tr>"
+                f"{change_cell(m['sell_change']) if has_change else ''}"
+                f"<td class='num'>{buy_disp}</td>"
+                f"{change_cell(m['buy_change']) if has_change else ''}{ratio_cell}</tr>"
             )
         margin_table = f"""
-        <h3 class="sub">個人信用残高(週次)</h3>
+        <h3 class="sub">個人信用残高({s.margin_cadence})</h3>
         <div class="table-scroll">
           <table>
             <tr>{header_cols}</tr>
