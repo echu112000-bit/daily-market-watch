@@ -35,6 +35,12 @@
    "buy_change": -61500,
    "sell": 107600,
    "sell_change": -5800
+  },
+  "2026-11-25": {
+   "buy": 1183900,
+   "buy_change": -77100,
+   "sell": 127200,
+   "sell_change": 19600
   }
  },
  "6777": {
@@ -73,6 +79,12 @@
    "buy_change": 1300,
    "sell": 200,
    "sell_change": -100
+  },
+  "2026-11-25": {
+   "buy": 215700,
+   "buy_change": 3400,
+   "sell": 700,
+   "sell_change": 500
   }
  },
  "8308": {
@@ -111,6 +123,12 @@
    "buy_change": -262500,
    "sell": 775400,
    "sell_change": 102400
+  },
+  "2026-11-25": {
+   "buy": 5040900,
+   "buy_change": 243200,
+   "sell": 783200,
+   "sell_change": 7800
   }
  }
 }
